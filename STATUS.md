@@ -1,7 +1,7 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (semantic-pipe / audit / elevate integration) — complete
+**Current milestone:** M4 (tests / smoke matrix) — complete
 
 ## Milestone map
 
@@ -38,10 +38,22 @@
   epilogue), `src/copy.pdx` (emit progress after successful copy +
   elevate retry on dst-open fail). walk.pdx documents the per-entry
   emit site inside walk_entry_todo (lands with R42 readdir substrate).
-- **M4 — tests + smoke (not started).** Single-file, multi-file,
-  recursive, over-existing (undo replayed), TXN-abort mid-copy,
-  cross-subtree elevate flow (auto-approve + human-approve paths),
-  signed-inode preservation matrix.
+- **M4 — tests + smoke (complete).** Three test-spec markdown
+  files under `tests/` — one per issue. 18 total matrix rows
+  across `M4-001-txn-abort.md` (5 rows: single-file happy path
+  runs today; multi-file + over-existing undo replay + TXN-abort
+  + TXN-commit-fail shape-land under R42 substrate gates),
+  `M4-002-elevate-flow.md` (6 rows: in-scope baseline + no-cap
+  ELVC_ERR_LOOKUP_FAIL run today; auto-approve OK + human-
+  approve OK/refused/timeout shape-land under libpdx-elevate.
+  M2-002/M3-001 + broker daemon boot + M4 harness mock granter),
+  `M4-003-signed-inode.md` (7 rows: key-locked degrade + verbose
+  degrade run today; same-user preserve + cross-user degrade +
+  recursive variants shape-land under libpdx-cap.M3-002 body-
+  edit + M4 harness `cap_tail_read`). Every row's observation-
+  hook assertions compile against the current cp .bss symbol
+  table; each spec's substrate-landing-gate table names the
+  body-edit landing sites for the shape-in-place rows.
 - **M5 — 1.0 signed release (not started).** Dual-signed
   manifest.pdxsig for cp v1.0 + CHANGELOG entry, pkgs.paideia-os
   mirror push, .pdxdoc for `doc cp`.

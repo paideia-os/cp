@@ -1,9 +1,10 @@
 # cp — paideia-as build manifest
 #
-# Wave: R50  Milestone: M3 (semantic-pipe / audit integration —
-#                            CopyProgressRecord[] via libpdx-semantic-pipe,
-#                            CopyRecord via libpdx-audit, libpdx-elevate
-#                            retry on cross-subtree dst-parent open fail)
+# Wave: R50  Milestone: M4 (tests + smoke matrix — three test-spec
+#                            markdown files under tests/ covering the 18
+#                            matrix rows the plan §5.6 M4 line enumerates;
+#                            no cp code change at M4, observation hooks
+#                            already exposed by the M2/M3 modules)
 # Doc:   design/tooling/r49-r50-plan.md §5.6 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
@@ -18,7 +19,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step at M5.
 
 name        = cp
-version     = 0.3.0-m3
+version     = 0.4.0-m4
 kind        = tool
 entry       = CpMain::cp_main
 output      = build-out/cp
