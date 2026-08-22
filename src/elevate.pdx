@@ -1,0 +1,247 @@
+// src/elevate.pdx — cp.M3-003
+// CpElevate module: libpdx-elevate retry when dst-parent crosses a
+// per-user-subtree boundary.
+//
+// Scope
+// -----
+// Plan §5.6 M3 line: `libpdx-elevate retry when dst-parent crosses a
+// per-user-subtree boundary that exceeds the invoker's scope`. When
+// cp's dst-parent write cap request would be denied because the
+// invoker's caps do not reach the destination subtree, cp asks the
+// elevate broker to widen the invoker's authority for a bounded
+// window (60s per design/user/model.md §5.1 example), then retries
+// the failed open once.
+//
+// M3-003 shape
+// ------------
+// One public entry point:
+//
+//   cp_elevate_try_dst_parent(dst_ptr) -> CP_ELEVATE_OK | CP_ELEVATE_REFUSED
+//     Called by CopyFile::copy_bytes_only from the
+//     copy_open_dst_fail branch iff the underlying pdxfs_open
+//     returned a negative errno (any error class — M3 does not yet
+//     distinguish -EACCES from -ENOENT because the substrate's
+//     cross-subtree signaling is not fully wired). Assembles a REQ
+//     frame requesting CP_ELEVATE_CAPS for CP_ELEVATE_DUR_NS, resolves
+//     the svc.elevate-broker endpoint, delegates to
+//     ElevateClient::elevate_client_request, and translates the
+//     libpdx-elevate return code to the two-state answer cp needs
+//     (OK — retry the open, REFUSED — propagate the original fail).
+//
+// The libpdx-elevate.M1-002 return codes are collapsed to two states:
+//   ELVC_OK   (0)            → CP_ELEVATE_OK
+//   Any other rc (ELVC_STUB, ELVC_ERR_*) → CP_ELEVATE_REFUSED
+//
+// ELVC_STUB (0xFFFFEA00) is libpdx-elevate.M1-002's happy-path
+// placeholder — the client library validates the request, resolves
+// the broker, and returns STUB because the broker's daemon body has
+// not yet landed. Translating STUB → REFUSED at M3 is deliberate:
+// cp cannot retry the open under an authority that was never
+// actually widened, so treating STUB as "did not elevate" is the
+// correct conservative behaviour. When libpdx-elevate.M3 lands
+// the real block-on-reply path, this module's return-code fold
+// starts distinguishing ELVC_OK from ELVC_STUB and cp starts
+// retrying the open on real approvals.
+//
+// Buffer sizing
+// -------------
+// The REQ frame (elevate_request_write_frame's output) is bounded
+// by ELV_REQ_MAX_LEN — checked against the paideia-os
+// elevate_request module. cp reserves 512 bytes for req_buf and
+// 512 bytes for reply_buf, both cache-line aligned (@align(64)),
+// which is comfortably larger than the R48b frame formats. Sizing
+// generously so a substrate frame-format widening does not force
+// a cp-side re-layout.
+//
+// caps bitmask
+// ------------
+// CP_ELEVATE_CAPS = 1 is an M3 placeholder representing "request
+// KIND_PDXFS_FILE(write, dst-parent)". libpdx-elevate.M3+ lands the
+// full ELVE_CAP_* bit vocabulary (per design/user/model.md §5.1);
+// M3 keeps the placeholder so the wire shape is exercisable today.
+// M4 replaces the placeholder with the real bitmask alongside the
+// broker-daemon boot integration test.
+//
+// Cross-module dependencies (libpdx-elevate @ ^0.1)
+// -------------------------------------------------
+//   ElevateClient::elevate_client_request(caps, dur, req_buf, reply_buf)
+//     src/elevate_client.pdx L245
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CpElevate (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest bare immediate: 1 for
+//     CP_ELEVATE_CAPS. CP_ELEVATE_DUR_NS = 60e9 > 2^32 so it is
+//     staged in r11 via a mov r11, imm64 which paideia-as encodes
+//     as movabs; no cmp against it, so the imm32 constraint does
+//     not apply to the mov encoding — the constraint is on cmp).
+//   - r11 is scratch (every lea for .bss slot addresses, and the
+//     duration-immediate stage).
+//   - cp_elevate_reset is leaf; cp_elevate_try_dst_parent is non-leaf.
+//     3-push prologue (rbx = dst_ptr preserved across the elevate
+//     call for a future dst-path echo in the diagnostic; r12 =
+//     pushed for parity; r13 = pushed for parity) plus a `sub rsp, 8`
+//     pad keeps rsp%16 == 0 at the nested call site.
+//   - No byte reads.
+
+module CpElevate = structure {
+
+  // -- Return codes for the M3 caller (CopyFile::copy_bytes_only) -------
+  pub let CP_ELEVATE_OK      : u64 = 0
+  pub let CP_ELEVATE_REFUSED : u64 = 1
+
+  // -- Elevate REQ parameters. --------------------------------------------
+  // CP_ELEVATE_CAPS is a bitmask placeholder — libpdx-elevate.M3+
+  // lands the full ELVE_CAP_* vocabulary (see design/user/model.md
+  // §5.1). Bit 0 loosely represents "KIND_PDXFS_FILE(write, dst-parent)".
+  pub let CP_ELEVATE_CAPS   : u64 = 1
+
+  // CP_ELEVATE_DUR_NS = 60 seconds in nanoseconds. Matches the
+  // design/user/model.md §5.1 example ("60s window") and pkg's own
+  // elevate request duration (see plan §5.1 M3-004). 60 * 10^9 =
+  // 60,000,000,000 = 0xDF8475800 — a 36-bit value; staged in r11
+  // via a mov r11, imm64 which paideia-as encodes as movabs (10-byte).
+  pub let CP_ELEVATE_DUR_NS : u64 = 60000000000
+
+  // -- Request + reply buffers. 512 bytes each; cache-line aligned. -----
+  // Sizing comfortably above the paideia-os elevate REQ / APR frame
+  // maxima (see ElevateRequest::ELV_REQ_MAX_LEN in libpdx-elevate).
+  // .bss slots so a subsequent invocation reuses the same storage.
+  pub let mut cp_elevate_req_buf   : [u8; 512] = uninit @align(64)
+  pub let mut cp_elevate_reply_buf : [u8; 512] = uninit @align(64)
+
+  // -- Counter slots for M4 test observability. --------------------------
+  pub let mut elevate_calls   : u64 = uninit @align(8)  // total invocations
+  pub let mut elevate_ok      : u64 = uninit @align(8)  // ELVC_OK returns
+  pub let mut elevate_refused : u64 = uninit @align(8)  // STUB + errors
+
+  // -- Diagnostic string for the log-and-continue path. Unused at M3
+  // -- (call site does not print); reserved for the M4 verbose surface.
+  pub let ELEVATE_REFUSED_MSG : [u8; 45] =
+    "cp: elevate refused (dst-parent out of scope)\n"
+  pub let ELEVATE_REFUSED_MSG_LEN : u64 = 45
+
+  // ============================================================================
+  // cp_elevate_reset()
+  //
+  // Signature: cp_elevate_reset : () -> () !{mem} @{}
+  //
+  // Zero the three counter slots so a subsequent cp invocation starts
+  // from a known baseline. The req/reply buffers are index-consumed
+  // by libpdx-elevate (write_frame overwrites req; recv_reply
+  // overwrites reply) so they do not need zeroing.
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let cp_elevate_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M3-003 CpElevate::cp_elevate_reset. Zero the three counter slots (elevate_calls / elevate_ok / elevate_refused) so cp_elevate_try_dst_parent accumulators start from a known baseline. Leaf; r11 scratch. cp_elevate_req_buf and cp_elevate_reply_buf are index-consumed by libpdx-elevate (write_frame overwrites req; recv_reply overwrites reply) so they do not need zeroing. Mirror of Undo::undo_reset shape.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + elevate_calls];   mov [r11], rax;
+        lea r11, [rip + elevate_ok];      mov [r11], rax;
+        lea r11, [rip + elevate_refused]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cp_elevate_try_dst_parent(dst_ptr) -> CP_ELEVATE_OK | CP_ELEVATE_REFUSED
+  //
+  // Signature: cp_elevate_try_dst_parent : (u64) -> u64 !{mem} @{}
+  // RDI (input): dst_ptr — VA of NUL-terminated destination path
+  //                        (informational at M3; passed to the caller
+  //                        for logging; the elevate REQ frame does
+  //                        not carry the path today — libpdx-elevate
+  //                        M3+ will accept a path field alongside caps).
+  // RAX (output): CP_ELEVATE_OK (0) on approval; CP_ELEVATE_REFUSED
+  //               (1) on any non-OK libpdx-elevate return (ELVC_STUB,
+  //               ELVC_ERR_LOOKUP_FAIL, ELVC_ERR_BAD_BUF, ELVC_ERR_
+  //               PACK_FAIL, etc.).
+  //
+  // Flow:
+  //   1. Bump elevate_calls counter.
+  //   2. rdi = CP_ELEVATE_CAPS
+  //      rsi = CP_ELEVATE_DUR_NS (staged via r11 movabs then mov rsi, r11)
+  //      rdx = &cp_elevate_req_buf
+  //      rcx = &cp_elevate_reply_buf
+  //   3. call ElevateClient::elevate_client_request
+  //   4. rax == 0 (ELVC_OK)  → bump elevate_ok, return CP_ELEVATE_OK.
+  //   5. rax != 0 (any other) → bump elevate_refused, return CP_ELEVATE_REFUSED.
+  //
+  // Register plan (non-leaf; 3-push + pad):
+  //   rbx = dst_ptr (preserved across the elevate call for future
+  //                  M4 diagnostic emission — unused at M3 but the
+  //                  push keeps the register alive so the M4 body-
+  //                  edit doesn't need a re-layout)
+  //   r12 = pushed for parity (unused; reserved for M4 timeout override)
+  //   r13 = pushed for parity (unused; reserved for M4 audit-id echo)
+  //   rax = elevate_client_request return
+  //   rdi, rsi, rdx, rcx = call arg carriers
+  //   r11 = lea scratch + duration-immediate stage
+  //
+  // rsp arithmetic:
+  //   entry:               rsp % 16 == 8
+  //   after 3 pushes:      rsp % 16 == 8 (24 bytes; 8+24 = 32; 32%16 = 0)
+  //   Correction: entry rsp%16 == 8; 3 pushes add 24; 8+24 = 32; 32%16 == 0.
+  //   after sub rsp, 8:    rsp % 16 == 8 — WRONG, need 0.
+  //   Actually 3 pushes brings rsp%16 to 0 (8+24=32, %16=0); adding
+  //   sub rsp, 8 shifts to %16 == 8 — NOT what we want. So no pad
+  //   needed. Use 3 pushes only, then rsp%16 == 0 at the call site.
+  // ============================================================================
+  pub let cp_elevate_try_dst_parent : (u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M3-003 CpElevate::cp_elevate_try_dst_parent. Wraps ElevateClient::elevate_client_request(caps=CP_ELEVATE_CAPS, dur=CP_ELEVATE_DUR_NS, req_buf=&cp_elevate_req_buf, reply_buf=&cp_elevate_reply_buf) with the two-state rc fold cp needs: ELVC_OK (0) → CP_ELEVATE_OK; any other libpdx-elevate rc (ELVC_STUB 0xFFFFEA00, ELVC_ERR_LOOKUP_FAIL 0xFFFFEA0F, ELVC_ERR_BAD_BUF 0xFFFFEA0B, ELVC_ERR_PACK_FAIL 0xFFFFEA0E) → CP_ELEVATE_REFUSED. Non-leaf: 3-push prologue (rbx = dst_ptr preserved for M4 diagnostic; r12 + r13 pushed for parity — reserved for M4 timeout-override + audit-id-echo body edits) — 3 pushes add 24 bytes; entry rsp%16 == 8; 8+24 = 32; 32%16 == 0 → rsp aligned for the elevate call without a sub rsp,8 pad. CP_ELEVATE_DUR_NS = 60000000000 = 0xDF8475800 is a 36-bit value; staged via `mov r11, 60000000000` which paideia-as encodes as movabs (10-byte); the imm32 cmp constraint does not apply (this is a mov, not a cmp). Counter bumps use the standard lea+mov+add+mov pattern. Effect envelope !{mem} @{} matches elevate_client_request's own tail (no sysreg because libpdx-elevate.M1-002 does not itself issue syscalls yet — the block-on-reply path lands at libpdx-elevate.M3+; !{mem} covers the .bss + buffer writes). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (only 0 appears in cmp). No test mnemonic; no byte reads.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = dst_ptr (preserved)
+
+        // ---- Bump elevate_calls ---------------------------------------------
+        lea r11, [rip + elevate_calls];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- Marshal elevate_client_request args ----------------------------
+        mov rdi, 1;                            // CP_ELEVATE_CAPS
+        mov r11, 60000000000;                  // CP_ELEVATE_DUR_NS (movabs)
+        mov rsi, r11;                          // dur
+        lea rdx, [rip + cp_elevate_req_buf];   // req_buf
+        lea rcx, [rip + cp_elevate_reply_buf]; // reply_buf
+        call ElevateClient::elevate_client_request;
+
+        cmp rax, 0;                            // ELVC_OK ?
+        jne cp_elevate_refused;
+
+        // ---- Approved — bump elevate_ok, return CP_ELEVATE_OK ---------------
+        lea r11, [rip + elevate_ok];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+        xor rax, rax;                          // CP_ELEVATE_OK
+        jmp cp_elevate_epilogue;
+
+      cp_elevate_refused:
+        // ---- Refused / STUB — bump elevate_refused, return REFUSED ----------
+        lea r11, [rip + elevate_refused];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+        mov rax, 1;                            // CP_ELEVATE_REFUSED
+
+      cp_elevate_epilogue:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

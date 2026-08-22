@@ -1,7 +1,7 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — complete
+**Current milestone:** M3 (semantic-pipe / audit / elevate integration) — complete
 
 ## Milestone map
 
@@ -27,10 +27,17 @@
   as stubs matching M1's txn-begin/commit stub discipline — R42
   substrate expansion is a body-edit landing site with no
   restructure required in cp.
-- **M3 — semantic-pipe / audit integration (not started).**
-  CopyProgressRecord[] per file via libpdx-semantic-pipe; CopyRecord
-  pre-output journal via libpdx-audit; libpdx-elevate retry when
-  the destination-parent crosses a per-user-subtree boundary.
+- **M3 — semantic-pipe / audit integration (complete).**
+  New modules `src/pipe.pdx` (CpPipe: bind fd 1 to
+  CopyProgressRecord@0.1 schema hash + per-file emit), `src/audit.pdx`
+  (CpAudit: begin/commit wrap around dispatch — audit_begin fires
+  before any user-visible output per D3), and `src/elevate.pdx`
+  (CpElevate: libpdx-elevate retry on dst-parent open failure).
+  Wire-in edits: `src/main.pdx` (three resets + pipe_bind_stdout),
+  `src/dispatch.pdx` (audit_begin_wrap at top + audit_commit_wrap at
+  epilogue), `src/copy.pdx` (emit progress after successful copy +
+  elevate retry on dst-open fail). walk.pdx documents the per-entry
+  emit site inside walk_entry_todo (lands with R42 readdir substrate).
 - **M4 — tests + smoke (not started).** Single-file, multi-file,
   recursive, over-existing (undo replayed), TXN-abort mid-copy,
   cross-subtree elevate flow (auto-approve + human-approve paths),
@@ -49,7 +56,9 @@ breakdown and cross-repo dependencies.
 - libpdx-cap M1 landed — indirect (loader-side manifest verify still
   uses the M1 skeleton; M2 flips to the real OK|MISSING|EXTRA compare).
 - libpdx-audit / libpdx-elevate / libpdx-semantic-pipe M1 all landed —
-  none are direct deps at cp.M1.
+  none are direct deps at cp.M1. M3 upgrades these to direct deps
+  (libpdx-semantic-pipe @ ^0.2, libpdx-audit @ ^0.2, libpdx-elevate
+  @ ^0.1) via manifest.pdxproj.
 - paideia-os R48 substrate closed: KIND_USER = 0x190,
   KIND_ELEVATE_CHANNEL = 0x191, KIND_PDXFS_FILE = 0x195,
   KIND_PDXFS_TXN = 0x196 (commits 411ad0e, e56a95b, 2ff76d4).

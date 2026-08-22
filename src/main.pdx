@@ -1,6 +1,7 @@
 // src/main.pdx — cp.M1-002 + cp.M2-001 (typed flag registration)
 //                + cp.M3-001 (semantic-pipe schema bind)
 //                + cp.M3-002 (audit state reset)
+//                + cp.M3-003 (elevate state reset)
 // CpMain module: cp_main(argc, argv) entry point.
 //
 // Scope
@@ -10,7 +11,7 @@
 // cp_main's return value is the process exit code the loader stub
 // passes to sys_exit (paideia-os syscall #60).
 //
-// Flow (M3-001):
+// Flow (M3):
 //   1. FlagSpec::reset()                — clear libpdx-argv's typed-flag
 //                                          registration table.
 //   2. StdVocab::register_all()         — register the 9 standard flags.
@@ -19,23 +20,24 @@
 //   4. ParsedArgs::reset()              — zero libpdx-argv's parse state.
 //   5. CpPipe::cp_pipe_reset()          — M3-001 counter baseline.
 //   6. CpAudit::cp_audit_reset()        — M3-002 audit-id baseline.
-//   7. Parser::parse_argv(argv, argc)   — walk argv into ParsedArgs.
+//   7. CpElevate::cp_elevate_reset()    — M3-003 elevate-counter baseline.
+//   8. Parser::parse_argv(argv, argc)   — walk argv into ParsedArgs.
 //      If it returns non-zero, print a short usage line on stderr
 //      and return exit code 2 (usage error).
-//   8. CpPipe::cp_pipe_bind_stdout()    — M3-001 bind fd 1 to the
+//   9. CpPipe::cp_pipe_bind_stdout()    — M3-001 bind fd 1 to the
 //                                          CopyProgressRecord@0.1 schema
 //                                          hash. Idempotent; bind failure
 //                                          bumps pipe_bind_errors but
 //                                          does NOT abort — the emit path
 //                                          is gated internally via
 //                                          SP_SEND_ERR_NOT_BOUND.
-//   9. Dispatch::dispatch_copy()        — mirrors CpFlags, validates
+//  10. Dispatch::dispatch_copy()        — mirrors CpFlags, validates
 //                                          positional count, wraps the
 //                                          whole invocation in the M3-002
 //                                          audit begin/commit pair, and
 //                                          routes to Walk::walk_recursive
 //                                          (-r) or CopyFile::copy_single_file.
-//  10. Return the dispatch call's exit code.
+//  11. Return the dispatch call's exit code.
 //
 // paideia-as compliance
 // ---------------------
@@ -60,6 +62,7 @@
 //   CpPipe::cp_pipe_reset        (this repo, src/pipe.pdx)   [M3-001]
 //   CpPipe::cp_pipe_bind_stdout  (this repo, src/pipe.pdx)   [M3-001]
 //   CpAudit::cp_audit_reset      (this repo, src/audit.pdx)  [M3-002]
+//   CpElevate::cp_elevate_reset  (this repo, src/elevate.pdx) [M3-003]
 
 module CpMain = structure {
 
@@ -107,7 +110,7 @@ module CpMain = structure {
   pub let cp_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M1-002 cp_main + cp.M2-001 typed-flag registration + cp.M3-001 pipe-schema-bind + cp.M3-002 audit-state-reset. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset libpdx-argv registration table → register standard + cp-owned flags → reset argv parse state → reset M3 module counters (pipe + audit) → parse via libpdx-argv → bind stdout to CopyProgressRecord@0.1 schema hash → hand off to Dispatch::dispatch_copy. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (9 calls now: 3 registration + 3 reset (parse+pipe+audit) + 1 parse + 1 pipe-bind + 1 dispatch, plus the optional print_err on the parse-fail path). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (Parser::parse_argv, ParsedArgs::reset, FlagSpec::reset are leaf; StdVocab::register_all, CpFlags::register_cp_flags declare their own 1-push alignment). The two M3 reset calls (cp_pipe_reset, cp_audit_reset) are leaves. cp_pipe_bind_stdout is non-leaf (1-push shape) but respects SysV callee-save so rbx/r12 survive. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Otherwise: cp_pipe_bind_stdout (return code ignored — bind failure is recoverable via SP_SEND_ERR_NOT_BOUND handling at emit); then tail-call-in-body-shape into Dispatch::dispatch_copy whose return value is our own. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
+      justification: "cp.M1-002 cp_main + cp.M2-001 typed-flag registration + cp.M3-001 pipe-schema-bind + cp.M3-002 audit-state-reset + cp.M3-003 elevate-state-reset. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset libpdx-argv registration table → register standard + cp-owned flags → reset argv parse state → reset M3 module counters (pipe/audit/elevate) → parse via libpdx-argv → bind stdout to CopyProgressRecord@0.1 schema hash → hand off to Dispatch::dispatch_copy. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (10 calls now: 3 registration + 4 reset + 1 parse + 1 pipe-bind + 1 dispatch, plus the optional print_err on the parse-fail path). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (Parser::parse_argv, ParsedArgs::reset, FlagSpec::reset are leaf; StdVocab::register_all, CpFlags::register_cp_flags declare their own 1-push alignment). The three M3 reset calls (cp_pipe_reset, cp_audit_reset, cp_elevate_reset) are leaves. cp_pipe_bind_stdout is non-leaf (1-push shape) but respects SysV callee-save so rbx/r12 survive. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Otherwise: cp_pipe_bind_stdout (return code ignored — bind failure is recoverable via SP_SEND_ERR_NOT_BOUND handling at emit); then tail-call-in-body-shape into Dispatch::dispatch_copy whose return value is our own. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 → 0
@@ -125,11 +128,12 @@ module CpMain = structure {
         // Step 2: reset libpdx-argv parse state.
         call ParsedArgs::reset;
 
-        // Step 2a (M3): reset the M3 module counters. All are leaves;
-        // they only zero counter .bss slots and do not touch any argv-
-        // derived state so ordering vs parse is irrelevant.
+        // Step 2a (M3): reset the M3 module counters. All three are
+        // leaves; they only zero counter .bss slots and do not touch
+        // any argv-derived state so ordering vs parse is irrelevant.
         call CpPipe::cp_pipe_reset;
         call CpAudit::cp_audit_reset;
+        call CpElevate::cp_elevate_reset;
 
         // Step 3: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
@@ -158,8 +162,9 @@ module CpMain = structure {
         // bytes even without a bound stdout schema.
         call CpPipe::cp_pipe_bind_stdout;
 
-        // Step 5: dispatch. dispatch_copy mirrors CpFlags from
-        // ParsedArgs and routes to Walk::walk_recursive (-r) or
+        // Step 5: dispatch. dispatch_copy wraps the whole invocation in
+        // the M3-002 audit begin/commit pair, opens the M2-004 outer
+        // TXN, and routes to Walk::walk_recursive (-r) or
         // CopyFile::copy_single_file.
         call Dispatch::dispatch_copy;
         // rax now carries dispatch's exit code; fall through.

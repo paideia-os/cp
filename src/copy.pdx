@@ -1,5 +1,6 @@
 // src/copy.pdx — cp.M1-003 + cp.M2-004 (TXN-hoist extract)
 //                + cp.M3-001 (CopyProgressRecord emit)
+//                + cp.M3-003 (libpdx-elevate retry on dst-parent open fail)
 // CopyFile module: single-file copy body.
 //
 // Scope
@@ -68,6 +69,7 @@
 //   Undo::maybe_record_over_existing           (this repo)  [M2-005]
 //   SignedInode::preserve_at_destination        (this repo)  [M2-002/003]
 //   CpPipe::cp_pipe_emit_progress               (this repo)  [M3-001]
+//   CpElevate::cp_elevate_try_dst_parent        (this repo)  [M3-003]
 //   CpPipe::bytes_copied (via .bss read)        (this repo)  [M3-001]
 //
 // paideia-as compliance
@@ -262,8 +264,30 @@ module CopyFile = structure {
         mov rsi, 0x41;                         // O_WRONLY | O_CREAT
         call Pdxfs::pdxfs_open;
         cmp rax, 0;
-        jl copy_open_dst_fail;
+        jge copy_open_dst_ok;                  // success on first try
 
+        // ---- Step 3a (M3-003): libpdx-elevate retry on dst-parent fail ----
+        // The first dst-open failed with a negative errno. Ask the
+        // elevate broker to widen the invoker's authority for a 60s
+        // window (see CpElevate::CP_ELEVATE_DUR_NS); on approval,
+        // retry the open once. libpdx-elevate.M1-002 returns
+        // ELVC_STUB today (no daemon body) which cp_elevate_try_dst_
+        // parent folds to CP_ELEVATE_REFUSED — so this arm is
+        // essentially a shape-in-place wire at M3; the M4 body-edit
+        // starts seeing CP_ELEVATE_OK once the broker daemon lands.
+        mov rdi, r12;                          // dst_ptr (informational)
+        call CpElevate::cp_elevate_try_dst_parent;
+        cmp rax, 0;                            // CP_ELEVATE_OK?
+        jne copy_open_dst_fail;                // refused → normal fail
+
+        // Elevate approved — retry the open once.
+        mov rdi, r12;                          // dst_ptr
+        mov rsi, 0x41;                         // O_WRONLY | O_CREAT
+        call Pdxfs::pdxfs_open;
+        cmp rax, 0;
+        jl copy_open_dst_fail;                 // still failing → give up
+
+      copy_open_dst_ok:
         mov r14, rax;                          // r14 = fd_dst
         lea r11, [rip + fd_dst];
         mov [r11], rax;
