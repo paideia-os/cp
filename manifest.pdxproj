@@ -1,8 +1,8 @@
 # cp — paideia-as build manifest
 #
 # Wave: R50  Milestone: M3 (semantic-pipe / audit / elevate integration —
-#                            in progress; this commit lands M3-001
-#                            CopyProgressRecord[] via libpdx-semantic-pipe)
+#                            in progress; M3-001 CopyProgressRecord[]
+#                            + M3-002 CopyRecord via libpdx-audit landed)
 # Doc:   design/tooling/r49-r50-plan.md §5.6 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
@@ -17,7 +17,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step at M5.
 
 name        = cp
-version     = 0.3.0-m3-001
+version     = 0.3.0-m3-002
 kind        = tool
 entry       = CpMain::cp_main
 output      = build-out/cp
@@ -33,29 +33,29 @@ caps_decl   = caps.decl
 #   M2-002 lands: signed_inode (cap-tail preservation stub).
 #   M2-005 lands: undo (--over-existing PdxFS v1 undo record stub).
 #   M3-001 lands: pipe   (CopyProgressRecord[] schema bind + emit).
+#   M3-002 lands: audit  (CopyRecord via libpdx-audit begin/commit wrap).
 sources:
   - src/print.pdx                 # M1-002 sys_write(fd=1/2) helper
   - src/pdxfs.pdx                 # M1-003 + M2 open/read/write/close/txn/readdir/mkdir/stat
   - src/copy.pdx                  # M1-003 + M2 + M3 single-file copy body (bytes-only extract)
-  - src/dispatch.pdx              # M1-002 + M2 flag gate + typed flags + recursive route
+  - src/dispatch.pdx              # M1-002 + M2 + M3 flag gate + audit wrap + typed flags + recursive route
   - src/main.pdx                  # M1-002 + M2 + M3 cp_main(argc, argv) entry point
   - src/flags.pdx                 # M2-001 CpFlags: typed-flag registration + mirror
   - src/walk.pdx                  # M2-001 Walk: recursive -r directory walk
   - src/signed_inode.pdx          # M2-002 SignedInode: cap-tail preservation stub
   - src/undo.pdx                  # M2-005 Undo: --over-existing PdxFS v1 undo record stub
   - src/pipe.pdx                  # M3-001 CpPipe: CopyProgressRecord@0.1 schema bind + per-file emit
+  - src/audit.pdx                 # M3-002 CpAudit: CopyRecord begin/commit wrap around dispatch
 
 # --- Library dependencies -----------------------------------------------
-# M3-001 pulls libpdx-semantic-pipe alongside libpdx-argv. The other two
-# shared libraries land in subsequent M3 issues:
-#   libpdx-audit         → M3-002 (CopyRecord pre-output journal)
-#   libpdx-elevate       → M3-003 (cross-subtree elevate retry)
-#   libpdx-cap           → M2 substrate-only today (signed-inode helpers
-#                              land in libpdx-cap.M3 — cp.M2's signed_inode
-#                              module is a shape-in-place stub until then).
+# M3-002 pulls libpdx-audit alongside libpdx-argv and libpdx-semantic-
+# pipe. libpdx-elevate lands next at M3-003. libpdx-cap remains M2-
+# substrate-only today (signed-inode helpers land in libpdx-cap.M3 —
+# cp.M2's signed_inode module is a shape-in-place stub until then).
 deps:
   - libpdx-argv @ ^0.2
   - libpdx-semantic-pipe @ ^0.2
+  - libpdx-audit @ ^0.2
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

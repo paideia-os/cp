@@ -1,0 +1,244 @@
+// src/audit.pdx — cp.M3-002
+// CpAudit module: CopyRecord (via libpdx-audit) wrap around every cp
+// invocation.
+//
+// Scope
+// -----
+// Plan §5.6 M3 line: `CopyRecord via libpdx-audit`. Every cp invocation
+// (single-file or `-r`) must journal an audit event so the supervisor
+// sees the tool starting (UEJ_KIND_TOOL_INVOKE = 130 at begin) and
+// exiting (UEJ_KIND_TOOL_EXIT = 133 at commit). D3 (audit-first) says
+// the begin record must land BEFORE any user-visible output; that
+// ordering is delivered here by placing cp_audit_begin_wrap at
+// dispatch_copy's entry (before txn_begin, before Print::print_err).
+//
+// M3-002 shape
+// ------------
+// Two public wrappers:
+//
+//   cp_audit_begin_wrap() -> audit_id | 0
+//     Called at dispatch_copy entry. Calls AuditClient::audit_begin
+//     with op_name = "cp\0" and op_args = "cp <src> <dst>\0" (M3
+//     placeholder — M4 rebuilds a real argv string from ParsedArgs
+//     ::pos_ptrs). Stores the returned audit_id in cp_audit_id. Returns
+//     the id (>0) on success, 0 on broker-unavailable / state-failure.
+//     Consumer contract at M3: log-and-continue on 0 (dispatch prints
+//     an informational stderr line and proceeds without an audit
+//     record). D3 audit-first strict-gating (audit_can_emit_output
+//     refuse-on-sticky-flag) is deferred to M4 with the elevate-broker
+//     boot integration so today's single-cp smoke path stays runnable
+//     against the M2 audit-broker stub.
+//
+//   cp_audit_commit_wrap(exit_code) -> AUDIT_OK | 0
+//     Called at dispatch_copy exit (immediately before the epilogue).
+//     If cp_audit_id == 0 (begin failed or was never called), no-op
+//     and return 0. Otherwise calls AuditClient::audit_commit
+//     (cp_audit_id, exit_code) which fires the UEJ_KIND_TOOL_EXIT
+//     record. Returns audit_commit's return code verbatim (AUDIT_OK
+//     on success, AUDIT_ERR_BROKER_UNAVAILABLE or AUDIT_ERR_SEND_FAILED
+//     on failure — cp does not gate on this at M3, same shape-in-place
+//     discipline as the begin wrapper).
+//
+// Cross-module dependencies (libpdx-audit @ ^0.2)
+// -----------------------------------------------
+//   AuditClient::audit_begin(op_name, op_args) -> audit_id | 0
+//     src/audit_client.pdx L53
+//   AuditClient::audit_commit(audit_id, exit_code) -> rc
+//     src/audit_client.pdx L210
+//
+// The libpdx-audit call chain internally issues sys_ipc_send (sysno
+// 42) against the svc.audit-journal broker — the broker itself is a
+// STUB at libpdx-audit.M2 (audit_broker_dispatch returns
+// AUDIT_BROKER_STUB), so today every cp invocation records the
+// sticky audit_broker_failed = 1 flag and cp still continues.
+//
+// M4 hardens by (a) adding an `audit_can_emit_output` gate before
+// every Print::print_err call (existing cp diagnostics); (b) exiting
+// 3 (per I4) when the gate refuses; (c) wiring the M4 broker-boot
+// integration test so the sticky flag stays 0 on the happy path.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CpAudit (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest immediate: 0 for the
+//     begin-fail gate; 0 for AUDIT_OK compare).
+//   - r11 is scratch (every lea for .bss / .rodata addresses).
+//   - Both wrappers are non-leaf. cp_audit_begin_wrap: 1-push prologue
+//     (rbx = pushed for alignment; unused body-side) keeps rsp%16 == 0
+//     for the audit_begin call. cp_audit_commit_wrap: 1-push prologue
+//     with rbx = exit_code preservation across the id-gate branch.
+//   - No byte reads (all qword-wide loads).
+
+module CpAudit = structure {
+
+  // -- Static op-name + op-args strings. NUL-terminated so
+  // -- libpdx-audit's downstream consumers can strlen them if needed.
+  //
+  // CP_OP_NAME_STR is exactly "cp" (2 bytes + NUL = 3). The .rodata
+  // slot alignment does not matter — audit_begin stores the raw
+  // pointer into record_op_name_ptr without inspecting the bytes.
+  //
+  // CP_OP_ARGS_STR is a fixed placeholder at M3. Semantics: the
+  // supervisor learns that cp was invoked but sees a canonical
+  // representation of the argument shape rather than a per-invocation
+  // reconstruction. M4 lands the real per-invocation argv render
+  // (walking ParsedArgs::pos_ptrs + flag_names[] with a fixed-size
+  // scratch buffer) which replaces this .rodata slot with a per-call
+  // .bss slot.
+  pub let CP_OP_NAME_STR : [u8; 3]  = "cp\0"
+  pub let CP_OP_ARGS_STR : [u8; 15] = "cp <src> <dst>\0"
+
+  // -- Singleton audit_id storage. Populated by cp_audit_begin_wrap
+  // -- and read by cp_audit_commit_wrap. Zero means "no audit in
+  // -- progress" (either begin was never called, or begin failed at
+  // -- the broker send hop).
+  pub let mut cp_audit_id : u64 = uninit @align(8)
+
+  // -- Diagnostic strings for the M3 log-and-continue paths. Both are
+  // -- optional (dispatch may or may not emit them depending on the
+  // -- audit_can_emit_output gate at M4); today they are unused —
+  // -- reserved slots so the M4 body-edit can wire them without a
+  // -- .rodata layout shift.
+  pub let AUDIT_BEGIN_FAIL_MSG : [u8; 40] =
+    "cp: audit begin failed (broker unavail)\n"
+  pub let AUDIT_BEGIN_FAIL_MSG_LEN : u64 = 40
+
+  pub let AUDIT_COMMIT_FAIL_MSG : [u8; 41] =
+    "cp: audit commit failed (broker unavail)\n"
+  pub let AUDIT_COMMIT_FAIL_MSG_LEN : u64 = 41
+
+  // ============================================================================
+  // cp_audit_reset()
+  //
+  // Signature: cp_audit_reset : () -> () !{mem} @{}
+  //
+  // Zero cp_audit_id so a subsequent cp_audit_begin_wrap starts from
+  // a known baseline. Called by CpMain::cp_main at process entry
+  // (mirrors ParsedArgs::reset / CpFlags::flags_reset shape). Leaf;
+  // r11 scratch.
+  // ============================================================================
+  pub let cp_audit_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M3-002 CpAudit::cp_audit_reset. Zero the cp_audit_id singleton so cp_audit_begin_wrap starts from a known baseline. Leaf; r11 scratch; mirror of CopyFile::copy_reset shape (xor rax,rax then lea+mov). No test mnemonic; no byte reads.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + cp_audit_id];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cp_audit_begin_wrap() -> audit_id
+  //
+  // Signature: cp_audit_begin_wrap : () -> u64 !{mem, sysreg} @{cap, sched}
+  // RAX (output): audit_id (> 0) on success; 0 on broker-unavail / state failure.
+  //
+  // Flow:
+  //   1. rdi = &CP_OP_NAME_STR (op_name)
+  //   2. rsi = &CP_OP_ARGS_STR (op_args placeholder)
+  //   3. call AuditClient::audit_begin
+  //   4. Store rax into cp_audit_id (may be 0 on failure — 0 is a
+  //      valid write; the commit wrapper's id-gate handles it).
+  //   5. Return rax verbatim.
+  //
+  // Effect envelope matches AuditClient::audit_begin's:
+  // !{mem, sysreg} @{cap, sched} — audit_begin issues sys_ipc_send
+  // internally which touches sysreg (SYSCALL clobber), consumes a
+  // KIND_IPC_ENDPOINT cap, and may reach sched via a broker-side wake.
+  //
+  // Register plan (non-leaf, 1-push prologue for alignment):
+  //   rbx = pushed for rsp%16 alignment (unused body-side)
+  //   rax = audit_begin return
+  //   rdi = op_name arg
+  //   rsi = op_args arg
+  //   r11 = lea scratch for the .rodata + .bss addresses
+  //
+  // rsp arithmetic:
+  //   entry:               rsp % 16 == 8
+  //   after push rbx:      rsp % 16 == 0  ← audit_begin call site
+  //   after pop rbx:       rsp % 16 == 8
+  // ============================================================================
+  pub let cp_audit_begin_wrap : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "cp.M3-002 CpAudit::cp_audit_begin_wrap. Wraps AuditClient::audit_begin with cp's static op_name + op_args placeholders. Non-leaf: 1-push prologue (rbx pushed for rsp%16==0 alignment across the audit_begin call; unused body-side) matches the CpFlags::register_cp_flags shape. audit_begin returns the allocated audit_id (>0) on success or 0 on state-gate failure / broker-unavailable. Both writes to cp_audit_id are legal — the id is 0 on failure and the commit-wrapper's id-gate short-circuits on that value. Effect envelope !{mem, sysreg} @{cap, sched} is the union of audit_begin's own effect set (see libpdx-audit/src/audit_client.pdx L53) — mem for the .bss + syscall bounce; sysreg for the SYSCALL clobber; cap for the sys_ipc_send endpoint consume; sched for the broker-side wake. Every immediate ≤ 0x7FFFFFFF (only 0 appears in cmp). No test mnemonic; no byte reads.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+
+        lea rdi, [rip + CP_OP_NAME_STR];       // op_name
+        lea rsi, [rip + CP_OP_ARGS_STR];       // op_args
+        call AuditClient::audit_begin;
+        // rax = audit_id (>0) or 0 on failure — either value is a
+        // legal store target for cp_audit_id (the commit wrapper's
+        // id-gate handles 0 as no-op).
+
+        lea r11, [rip + cp_audit_id];
+        mov [r11], rax;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cp_audit_commit_wrap(exit_code) -> rc
+  //
+  // Signature: cp_audit_commit_wrap : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+  // RDI (input): exit_code — cp's exit code being handed back to the
+  //                          loader stub (0..4 in cp's exit-code space).
+  // RAX (output): AUDIT_OK (0) on success; non-zero on failure; also
+  //               returns 0 as a no-op when cp_audit_id == 0 (begin
+  //               was never successful).
+  //
+  // Flow:
+  //   1. Load cp_audit_id; if 0, return 0 (no-op — nothing to commit).
+  //   2. rdi = audit_id, rsi = exit_code
+  //   3. call AuditClient::audit_commit
+  //   4. Return rax verbatim.
+  //
+  // Register plan (non-leaf, 1-push prologue):
+  //   rbx = exit_code (preserved across the id-gate load and audit_commit call)
+  //   rax = audit_id load / audit_commit return
+  //   rdi = audit_id arg
+  //   rsi = exit_code arg
+  //   r11 = lea scratch
+  //
+  // rsp arithmetic:
+  //   entry:               rsp % 16 == 8
+  //   after push rbx:      rsp % 16 == 0  ← audit_commit call site
+  //   after pop rbx:       rsp % 16 == 8
+  // ============================================================================
+  pub let cp_audit_commit_wrap : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "cp.M3-002 CpAudit::cp_audit_commit_wrap. Wraps AuditClient::audit_commit with the stored cp_audit_id + caller's exit_code. Non-leaf: 1-push prologue (rbx = exit_code preserved across the audit_id load and audit_commit call) keeps rsp%16 == 0 at the nested call site. Two exit paths: (a) cp_audit_id == 0 → return 0 (no-op — begin was never successful, no record to commit); (b) audit_commit(audit_id, exit_code) → return the rc verbatim (AUDIT_OK on success, AUDIT_ERR_BROKER_UNAVAILABLE (3) or AUDIT_ERR_SEND_FAILED (4) on failure). cp does NOT branch on the commit rc at M3 — the return value is informational; dispatch propagates its own body exit code regardless. Effect envelope matches audit_commit's !{mem, sysreg} @{cap, sched}. Every immediate ≤ 0x7FFFFFFF (only 0 appears in cmp). No test mnemonic; no byte reads.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = exit_code (preserved)
+
+        // Gate: if cp_audit_id == 0, no-op.
+        lea r11, [rip + cp_audit_id];
+        mov rax, [r11];
+        cmp rax, 0;
+        je cp_audit_commit_noop;
+
+        // rax = audit_id; move to rdi. rsi = exit_code from rbx.
+        mov rdi, rax;
+        mov rsi, rbx;
+        call AuditClient::audit_commit;
+        // rax = audit_commit's rc; propagate verbatim.
+        jmp cp_audit_commit_epilogue;
+
+      cp_audit_commit_noop:
+        xor rax, rax;                          // AUDIT_OK sentinel; means no-op
+
+      cp_audit_commit_epilogue:
+        pop rbx;
+        ret
+      }
+    }
+}

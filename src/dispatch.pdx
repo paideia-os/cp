@@ -1,6 +1,7 @@
 // src/dispatch.pdx — cp.M1-002 (bodies) + cp.M1-003 (happy-arm wire)
 //                    + cp.M2-001 (typed flags + recursive route)
 //                    + cp.M2-004 (single-TXN hoist across whole invocation)
+//                    + cp.M3-002 (audit begin/commit wrap around dispatch)
 // Dispatch module: flag gate + positional-count validate + route +
 // outer KIND_PDXFS_TXN wrap.
 //
@@ -39,6 +40,8 @@
 //   Pdxfs::pdxfs_txn_commit      (this repo, src/pdxfs.pdx) [M2-004: TXN wrap]
 //   Pdxfs::pdxfs_txn_abort       (this repo, src/pdxfs.pdx) [M2-004: partial rollback]
 //   Print::print_err             (this repo, src/print.pdx)
+//   CpAudit::cp_audit_begin_wrap  (this repo, src/audit.pdx) [M3-002]
+//   CpAudit::cp_audit_commit_wrap (this repo, src/audit.pdx) [M3-002]
 //
 // paideia-as compliance
 // ---------------------
@@ -179,12 +182,21 @@ module Dispatch = structure {
   pub let dispatch_copy : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M2-001 typed flags + cp.M2-004 single-TXN hoist. Migrates the M1 byte-compare walk to CpFlags mirror check and hoists the KIND_PDXFS_TXN wrap from copy_single_file to dispatch level so a SINGLE outer TXN spans the whole invocation (single-file or recursive) — per plan §5.6 M2 line `single-TXN atomicity across whole invocation (partial rollback)`. Flow: reset+populate CpFlags → pos_count gate (usage-error exits pre-TXN) → pdxfs_txn_begin → route to Walk::walk_recursive or CopyFile::copy_bytes_only (body exit saved in rbx) → on body fail call pdxfs_txn_abort (silent, unwind partial writes) and return body exit → on body ok call pdxfs_txn_commit → return 0 on commit-ok, 1 with diagnostic on commit-fail. 2-push prologue (rbx=body_exit, r12=reserved for M3 audit_id) + `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call site (7 call sites: flags_reset, populate, print_err, txn_begin, walk_recursive/copy_bytes_only, txn_abort, txn_commit). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (largest: 2 for pos_count, 4 for ARM_RECURSIVE_WALK). Negative-errno detection on TXN returns uses cmp rax,0; jl (signed compare).",
+      justification: "cp.M2-001 typed flags + cp.M2-004 single-TXN hoist + cp.M3-002 audit wrap. Migrates the M1 byte-compare walk to CpFlags mirror check, hoists the KIND_PDXFS_TXN wrap from copy_single_file to dispatch level so a SINGLE outer TXN spans the whole invocation, and wraps the entire dispatch in a libpdx-audit begin/commit pair so the supervisor sees UEJ_KIND_TOOL_INVOKE at entry and UEJ_KIND_TOOL_EXIT at exit — per plan §5.6 M2/M3 lines. D3 (audit-first) ordering: cp_audit_begin_wrap fires BEFORE the pos_count gate (which itself could emit USAGE_MSG on stderr); begin therefore lands before any user-visible output. Flow: audit_begin_wrap → reset+populate CpFlags → pos_count gate (usage-error exits pre-TXN, audit_commit_wrap still fires at epilogue with exit_code=2) → pdxfs_txn_begin → route to Walk::walk_recursive or CopyFile::copy_bytes_only (body exit saved in rbx) → on body fail call pdxfs_txn_abort (silent, unwind partial writes) and return body exit → on body ok call pdxfs_txn_commit → return 0 on commit-ok, 1 with diagnostic on commit-fail. Every exit path routes through dispatch_epilogue which does the M3-002 audit_commit_wrap(exit_code=rax) call BEFORE the stack cleanup — the exit code is saved in rbx across the commit call (which is caller-save-clobbering) and restored to rax before ret. 2-push prologue (rbx=body_exit/save-across-commit, r12=reserved for M3 audit_id echo) + `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call site (9 call sites: audit_begin_wrap, flags_reset, populate, print_err, txn_begin, walk_recursive/copy_bytes_only, txn_abort, txn_commit, audit_commit_wrap). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (largest: 2 for pos_count, 4 for ARM_RECURSIVE_WALK). Negative-errno detection on TXN returns uses cmp rax,0; jl (signed compare).",
       block: {
         // ---- Prologue -------------------------------------------------------
         push rbx;                              // rsp%16: 8 → 0
         push r12;                              // rsp%16: 0 → 8
         sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // ---- Step 0 (M3-002): audit begin ----------------------------------
+        // MUST fire before any user-visible output (D3 audit-first).
+        // The pos_count gate below may emit USAGE_MSG on stderr, so
+        // begin lands here at the top. cp_audit_begin_wrap's return
+        // (audit_id or 0) is stored inside CpAudit's .bss slot; we
+        // do not gate on it at M3 (broker unavailable is a shape-in-
+        // place condition today; M4 hardens with audit_can_emit_output).
+        call CpAudit::cp_audit_begin_wrap;
 
         // ---- Step 1: mirror the four cp flag IDs ---------------------------
         call CpFlags::flags_reset;
@@ -280,6 +292,20 @@ module Dispatch = structure {
         jmp dispatch_epilogue;
 
       dispatch_epilogue:
+        // ---- Step 6 (M3-002): audit commit -------------------------------
+        // Every path lands here with rax == the exit code that will be
+        // returned to the caller. cp_audit_commit_wrap(exit_code) fires
+        // UEJ_KIND_TOOL_EXIT with the correct exit code. The commit-wrap
+        // call is caller-save-clobbering (rax at minimum), so we save
+        // the exit code in rbx (already pushed at prologue; will be
+        // popped below) and restore rax = rbx after the call. The
+        // commit-wrap return value (AUDIT_OK or non-zero) is discarded —
+        // audit-broker-unavailable at M3 does not change the exit code.
+        mov rbx, rax;                          // save exit code
+        mov rdi, rbx;                          // audit_commit_wrap arg = exit_code
+        call CpAudit::cp_audit_commit_wrap;
+        mov rax, rbx;                          // restore exit code
+
         add rsp, 8;
         pop r12;
         pop rbx;
