@@ -70,7 +70,7 @@
 //     with rbx = exit_code preservation across the id-gate branch.
 //   - No byte reads (all qword-wide loads).
 
-module CpAudit = structure {
+module Audit = structure {
 
   // -- Static op-name + op-args strings. NUL-terminated so
   // -- libpdx-audit's downstream consumers can strlen them if needed.

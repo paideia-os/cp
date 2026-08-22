@@ -85,7 +85,7 @@
 //     pad keeps rsp%16 == 0 at the nested call site.
 //   - No byte reads.
 
-module CpElevate = structure {
+module Elevate = structure {
 
   // -- Return codes for the M3 caller (CopyFile::copy_bytes_only) -------
   pub let CP_ELEVATE_OK      : u64 = 0

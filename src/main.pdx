@@ -64,7 +64,7 @@
 //   CpAudit::cp_audit_reset      (this repo, src/audit.pdx)  [M3-002]
 //   CpElevate::cp_elevate_reset  (this repo, src/elevate.pdx) [M3-003]
 
-module CpMain = structure {
+module Main = structure {
 
   // -- Local diagnostic strings -----------------------------------------
   // Emitted when libpdx-argv reports a parse error. A later milestone

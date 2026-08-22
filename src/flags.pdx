@@ -49,7 +49,7 @@
 //     purely to keep rsp%16 == 0 for the nested calls). Same shape as
 //     StdVocab::register_all in libpdx-argv.
 
-module CpFlags = structure {
+module Flags = structure {
 
   // -- Numeric IDs. Tool-specific IDs must start at 100 per the
   // -- convention documented in libpdx-argv StdVocab.pdx (IDs 1..9

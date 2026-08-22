@@ -86,7 +86,7 @@
 //   - 5-push prologue, rsp%16 == 0 at every nested call site; matching
 //     5-pop epilogue with rax carrying the exit code.
 
-module CopyFile = structure {
+module Copy = structure {
 
   // -- Buffer + counter storage ----------------------------------------
   // COPY_BUF_LEN kept at 4096 for a good syscall-count / .bss-pressure

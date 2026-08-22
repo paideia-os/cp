@@ -85,7 +85,7 @@
 //     into cp_progress_rec before the Send call.
 //   - No byte reads (all qword-wide field writes).
 
-module CpPipe = structure {
+module Pipe = structure {
 
   // -- Record layout constants ------------------------------------------
   pub let COPY_PROGRESS_REC_LEN : u64 = 40
