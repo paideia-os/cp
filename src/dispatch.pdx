@@ -1,0 +1,248 @@
+// src/dispatch.pdx — cp.M1-002
+// Dispatch module: flag gate + positional-count validate + route.
+//
+// Scope
+// -----
+// The M1 argv surface (see design/argv-surface.md) accepts four cp-
+// specific flags (`-r`, `-v`, `--dry-run`, `--over-existing`) and two
+// required positionals (src, dst). This module walks the parsed argv
+// state that libpdx-argv left in ParsedArgs (.bss singletons) and
+// picks one of three exits:
+//
+//   1. `-r` present  → RECURSIVE_NOT_YET_MSG on stderr; EXIT 3.
+//                       (Recursive walk lands at M2 per plan §5.6.)
+//   2. pos_count != 2 → USAGE_MSG on stderr; EXIT 2.
+//   3. otherwise      → dispatch to CopyFile::copy_single_file
+//                       (M1-002 stub prints COPY_STUB_MSG and returns
+//                       3; M1-003 replaces the stub arm with the
+//                       real call).
+//
+// The `-v`, `--dry-run`, and `--over-existing` flags are recognised
+// by libpdx-argv (they appear in ParsedArgs::flag_names[]) but are
+// ignored by dispatch at M1: their bodies land in later milestones
+// (M3-001 for -v via libpdx-semantic-pipe; M2 for --dry-run and
+// --over-existing).
+//
+// Cross-module externs consumed
+// -----------------------------
+//   ParsedArgs::flag_count       (libpdx-argv .bss)
+//   ParsedArgs::flag_names       (libpdx-argv .bss, [u64;32])
+//   ParsedArgs::pos_count        (libpdx-argv .bss)
+//   Print::print_err             (this repo, src/print.pdx)
+//   (M1-003 adds: CopyFile::copy_single_file)
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Dispatch (PascalCase basename).
+//   - No test mnemonic; every zero-check uses cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (all char codes and lengths
+//     used here are single-byte values ≤ 0x7F).
+//   - r11 is scratch; used in every lea for the .bss externals and
+//     the .rodata diagnostic strings.
+//   - Byte loads use xor rax,rax; mov_b rax,[ptr] per the #1248
+//     mitigation.
+//   - 1-push prologue (rbx) aligns rsp%16 to 0 for the nested
+//     Print::print_err calls; rbx unused body-side at M1 but present
+//     for the M2/M3 shape that will preserve src/dst pointers or the
+//     copy exit code across cross-file calls.
+
+module Dispatch = structure {
+
+  // -- Exit codes --------------------------------------------------------
+  // See design/argv-surface.md §5 for the full contract. Codes 3 and 4
+  // are deliberately reserved so a script can distinguish
+  // "vocabulary-recognised-but-not-wired" (3) from "cap-denied" (4)
+  // from generic "op-failed" (1).
+  pub let EXIT_OK                : u64 = 0
+  pub let EXIT_OP_FAIL           : u64 = 1
+  pub let EXIT_USAGE             : u64 = 2
+  pub let EXIT_NOT_YET_IMPL      : u64 = 3
+  pub let EXIT_CAP_DENIED        : u64 = 4
+
+  // -- Diagnostic strings emitted on the three exits -------------------
+  //
+  // USAGE_MSG covers every wrong-positional case at M1 (zero args, one
+  // arg, three-or-more args). M2+ can distinguish these once a
+  // directory-target `cp <src>... <dir>` shape lands, at which point
+  // "three-or-more" becomes valid.
+  pub let USAGE_MSG : [u8; 60] =
+    "cp: usage error (expected exactly two positional arguments)\n"
+  pub let USAGE_MSG_LEN : u64 = 60
+
+  // RECURSIVE_NOT_YET_MSG covers the `-r` short-flag path. The full
+  // recursive body ships at M2 per plan doc §5.6.
+  pub let RECURSIVE_NOT_YET_MSG : [u8; 64] =
+    "cp: recursive copy (-r) not yet implemented at M1 (lands at M2)\n"
+  pub let RECURSIVE_NOT_YET_MSG_LEN : u64 = 64
+
+  // COPY_STUB_MSG marks the happy-path arm that M1-002 leaves as a
+  // stub. M1-003 replaces the stub print + exit-3 with a real call to
+  // CopyFile::copy_single_file. Kept here at M1-002 so a caller can
+  // wire `cp a b` in a script today; the script gets a clear message
+  // and a distinct exit code rather than a silent success or a
+  // signal.
+  pub let COPY_STUB_MSG : [u8; 58] =
+    "cp: copy body not implemented at M1-002 (lands at M1-003)\n"
+  pub let COPY_STUB_MSG_LEN : u64 = 58
+
+  // -- Dispatch state ---------------------------------------------------
+  // Records which arm fired; useful at M3 for the audit-first journal
+  // record that has to name the operation before any output.
+  // Values: 0 = none, 1 = single-file copy (happy path), 2 = usage,
+  // 3 = recursive-not-yet.
+  pub let mut chosen_arm : u64 = uninit @align(8)
+
+  // ============================================================================
+  // dispatch_reset()
+  //
+  // Signature: dispatch_reset : () -> () !{mem} @{}
+  //
+  // Clear chosen_arm so a subsequent dispatch_copy call starts from a
+  // known-zero baseline. Called by cp_main before it hands control to
+  // dispatch_copy.
+  // ============================================================================
+  pub let dispatch_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M1-002 dispatch_reset. Zero chosen_arm so dispatch_copy starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf; r11 scratch used only for the lea.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + chosen_arm];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dispatch_copy() -> exit_code
+  //
+  // Signature: dispatch_copy : () -> u64 !{mem, sysreg} @{}
+  // RAX (output): exit code (0..4)
+  //
+  // Flow:
+  //   Step 1: walk ParsedArgs::flag_names[0..flag_count] looking for a
+  //           name whose two bytes are 'r' (0x72) then NUL (0). Any
+  //           match → jump to the RECURSIVE_NOT_YET arm.
+  //           The walk uses r10 as index, rcx as the loop bound
+  //           (flag_count loaded once at the top), rdi as the current
+  //           flag name pointer. r11 is scratch for every lea.
+  //   Step 2: load ParsedArgs::pos_count. If != 2 → USAGE arm.
+  //   Step 3: happy path. M1-002 STUB: print COPY_STUB_MSG on stderr
+  //           and return 3. M1-003 replaces this arm with a real call
+  //           to CopyFile::copy_single_file(pos_ptrs[0], pos_ptrs[1]).
+  //
+  // Prologue: 1 push (rbx). rsp%16 was 8 on entry (SysV call), one
+  // push brings it to 0 for the nested Print::print_err calls. rbx
+  // unused body-side at M1 but preserved for the M2/M3 shape that
+  // will save src/dst ptrs or the copy exit code across cross-file
+  // calls.
+  //
+  // Register plan (M1-002):
+  //   rbx = unused; preserved for M1-003's shape parity
+  //   rcx = flag_count / pos_count loaded value
+  //   r10 = flag-loop counter
+  //   rdi, rsi = print_err arguments / current flag pointer
+  //   rax = byte-load scratch / return value
+  //   r11 = lea scratch (every .bss / .rodata address)
+  // ============================================================================
+  pub let dispatch_copy : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-002 dispatch_copy. Walk ParsedArgs::flag_names[] looking for 'r\\0' (short -r flag); on hit exit 3 with RECURSIVE_NOT_YET_MSG. Otherwise gate on ParsedArgs::pos_count == 2; on !=2 exit 2 with USAGE_MSG. Otherwise (M1-002 stub) print COPY_STUB_MSG and exit 3 — M1-003 replaces this arm with a real CopyFile::copy_single_file call. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested Print::print_err calls. rbx preserved for M1-003 shape parity. The -r walk uses r10 as index, rcx as loop bound (flag_count loaded once), rdi as current flag pointer; the two-byte compare uses xor rax,rax; mov_b rax,[rdi/rdi+1] per the #1248 mitigation. Every cmp uses an immediate ≤ 0x7F (single-byte char codes). Every fail arm structure is print+pop+exit-code+ret so rax carries the exit code out cleanly.",
+      block: {
+        push rbx;
+
+        // ---- Step 1: walk flag_names[] for '-r' (short flag = 'r'\0) ----
+        xor r10, r10;                          // r10 = i = 0
+        lea r11, [rip + ParsedArgs::flag_count];
+        mov rcx, [r11];                        // rcx = flag_count (loop bound)
+
+      dispatch_flag_loop_head:
+        cmp r10, rcx;
+        jge dispatch_flag_done;
+
+        // rdi = flag_names[i]
+        lea r11, [rip + ParsedArgs::flag_names];
+        mov rdi, [r11 + r10*8];
+
+        // Byte 0 must be 'r' (0x72). #1248 pattern.
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, 0x72;
+        jne dispatch_flag_next;
+
+        // Byte 1 must be NUL. Single-letter short flag guaranteed by
+        // libpdx-argv M1-002 (clustered short flags → ERR_CLUSTERED_
+        // SHORT rejected at parse time — see parser.pdx in libpdx-
+        // argv), but the parser stores the byte after the letter as
+        // whatever was there; a two-byte compare defends against a
+        // future long-flag "-r" alias slipping in.
+        xor rax, rax;
+        mov_b rax, [rdi + 1];
+        cmp rax, 0;
+        jne dispatch_flag_next;
+
+        // Match — `-r` set. Skip to the recursive-not-yet arm.
+        jmp dispatch_recursive_not_yet;
+
+      dispatch_flag_next:
+        add r10, 1;
+        jmp dispatch_flag_loop_head;
+
+      dispatch_flag_done:
+
+        // ---- Step 2: pos_count == 2 check ----
+        lea r11, [rip + ParsedArgs::pos_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne dispatch_usage_error;
+
+        // ---- Step 3: happy path (M1-002 STUB) ----
+        // M1-003 replaces this arm with:
+        //   lea r11, [rip + ParsedArgs::pos_ptrs];
+        //   mov rdi, [r11 + 0];                  // src
+        //   mov rsi, [r11 + 8];                  // dst
+        //   call CopyFile::copy_single_file;
+        //   pop rbx;
+        //   ret
+        // No other line in this function changes at M1-003.
+        mov rax, 1;
+        lea r11, [rip + chosen_arm];
+        mov [r11], rax;
+
+        lea rdi, [rip + COPY_STUB_MSG];
+        mov rsi, 58;                           // COPY_STUB_MSG_LEN
+        call Print::print_err;
+
+        pop rbx;
+        mov rax, 3;                            // EXIT_NOT_YET_IMPLEMENTED
+        ret
+
+      dispatch_recursive_not_yet:
+        mov rax, 3;
+        lea r11, [rip + chosen_arm];
+        mov [r11], rax;
+
+        lea rdi, [rip + RECURSIVE_NOT_YET_MSG];
+        mov rsi, 64;                           // RECURSIVE_NOT_YET_MSG_LEN
+        call Print::print_err;
+
+        pop rbx;
+        mov rax, 3;                            // EXIT_NOT_YET_IMPLEMENTED
+        ret
+
+      dispatch_usage_error:
+        mov rax, 2;
+        lea r11, [rip + chosen_arm];
+        mov [r11], rax;
+
+        lea rdi, [rip + USAGE_MSG];
+        mov rsi, 60;                           // USAGE_MSG_LEN
+        call Print::print_err;
+
+        pop rbx;
+        mov rax, 2;                            // EXIT_USAGE
+        ret
+      }
+    }
+}

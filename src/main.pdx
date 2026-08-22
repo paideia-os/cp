@@ -1,0 +1,133 @@
+// src/main.pdx — cp.M1-002
+// CpMain module: cp_main(argc, argv) entry point.
+//
+// Scope
+// -----
+// The paideia-as loader stub reads argc/argv from the stack per the
+// SysV/x86_64 convention and calls cp_main(argc in rdi, argv in rsi);
+// cp_main's return value is the process exit code the loader stub
+// passes to sys_exit (paideia-os syscall #60).
+//
+// Flow:
+//   1. ParsedArgs::reset() — zero libpdx-argv's parse state.
+//   2. Parser::parse_argv(argv, argc) — walk argv into ParsedArgs.
+//      If it returns non-zero, print a short usage line on stderr
+//      and return exit code 2 (usage error). A later milestone
+//      replaces the hand-rolled diagnostic with a doc-back-end call
+//      once `doc cp --help` reaches a stable release (see the
+//      cross-repo dep in the plan doc §5.6 M5 line).
+//   3. Dispatch::dispatch_copy() — validates flags + positional count
+//      and either runs the M1-003 copy body or exits with a
+//      distinguishing code (3 for recognised-but-not-wired-yet, 2 for
+//      wrong positional count).
+//   4. Return the dispatch call's exit code.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CpMain (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - r11 is scratch; used in every lea for the .rodata parse-fail
+//     message base.
+//   - 2-push prologue (rbx, r12) + a reserved 8-byte pad keeps
+//     rsp%16 == 0 at every nested call site. See the register-plan
+//     comment on cp_main below.
+//
+// Cross-module externs consumed
+// -----------------------------
+//   ParsedArgs::reset            (libpdx-argv)
+//   Parser::parse_argv           (libpdx-argv)
+//   Dispatch::dispatch_copy      (this repo, src/dispatch.pdx)
+//   Print::print_err             (this repo, src/print.pdx)
+
+module CpMain = structure {
+
+  // -- Local diagnostic strings -----------------------------------------
+  // Emitted when libpdx-argv reports a parse error. A later milestone
+  // replaces this with a `doc cp --help` invocation; M1 keeps the
+  // message small and hand-rolled so cp has no dep on `doc` at M1.
+  pub let PARSE_FAIL_MSG : [u8; 39] =
+    "cp: argv parse error (run 'cp --help')\n"
+  pub let PARSE_FAIL_MSG_LEN : u64 = 39
+
+  // ============================================================================
+  // cp_main(argc, argv) -> exit_code
+  //
+  // Signature: cp_main : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): argc — number of argv entries
+  // RSI (input): argv — pointer to a u64 array of NUL-terminated arg ptrs
+  // RAX (output): exit code (0 ok / 1 op-fail / 2 usage / 3 not-yet-impl /
+  //                          4 cap-denied [reserved])
+  //
+  // Register plan (2-push + 8-byte reserved pad frame):
+  //   rbx = argv        (preserved across every nested call)
+  //   r12 = argc        (preserved across every nested call)
+  //   [rsp + 0] = pad   (keeps rsp%16 == 0 at every nested call site)
+  //   rax = call return / temp
+  //   rdi, rsi = nested-call arg carriers
+  //   r11 = lea scratch
+  //
+  // rsp arithmetic:
+  //   caller-of-cp_main:   rsp % 16 == 0 immediately before call
+  //   after CALL:          rsp % 16 == 8  (return address pushed)
+  //   after push rbx:      rsp % 16 == 0
+  //   after push r12:      rsp % 16 == 8
+  //   after sub rsp, 8:    rsp % 16 == 0  ← every nested call ok
+  //   epilogue reverses.
+  //
+  // Note: cp_main preserves argc/argv in rbx/r12 across the
+  // Parser::parse_argv call even though libpdx-argv does not read them
+  // back from those regs. The preservation is defensive: it costs one
+  // extra prologue instruction and makes the parse-fail diagnostic
+  // path free to touch argc/argv (e.g. for a future "argv[error_arg_
+  // index]" render — libpdx-argv already stores error_arg_index in
+  // ParsedArgs).
+  // ============================================================================
+  pub let cp_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (argc: u64) (argv: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-002 cp_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv → hand off to Dispatch::dispatch_copy (which walks ParsedArgs .bss for the positional-count check + the -r flag gate + the M1-003 copy body call). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (Parser::parse_argv, ParsedArgs::reset, Dispatch::dispatch_copy, Print::print_err). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see its Parser::parse_argv justification which declares leaf semantics; ParsedArgs::reset is trivially leaf). Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Otherwise: tail-call-in-body-shape into Dispatch::dispatch_copy whose return value is our own. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
+      block: {
+        // Prologue: preserve argc/argv, align stack.
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov rbx, rsi;                          // rbx = argv
+        mov r12, rdi;                          // r12 = argc
+
+        // Step 1: reset libpdx-argv state.
+        call ParsedArgs::reset;
+
+        // Step 2: parse. rdi = argv, rsi = argc.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call Parser::parse_argv;
+
+        // Step 3: check parse error. rax == 0 (ERR_OK) → continue.
+        cmp rax, 0;
+        je cp_main_parse_ok;
+
+        // Parse failed: print diagnostic, return EXIT_USAGE.
+        lea rdi, [rip + PARSE_FAIL_MSG];
+        mov rsi, 39;                           // PARSE_FAIL_MSG_LEN
+        call Print::print_err;
+
+        mov rax, 2;                            // EXIT_USAGE
+        jmp cp_main_epilogue;
+
+      cp_main_parse_ok:
+        // Step 4: dispatch. dispatch_copy walks ParsedArgs (.bss)
+        // for the flag gate + positional-count check + copy call.
+        call Dispatch::dispatch_copy;
+        // rax now carries dispatch's exit code; fall through.
+
+      cp_main_epilogue:
+        // Restore stack, return with rax carrying the exit code.
+        add rsp, 8;                            // undo pad
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -23,12 +23,14 @@ caps_decl   = caps.decl
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
+#
+# Grouped by the M1 issue that adds each file:
+#   M1-002 lands: print, dispatch, main (argv surface + flag gate).
+#   M1-003 lands: pdxfs, copy (first-runnable single-file copy).
 sources:
-  - src/print.pdx                 # sys_write(fd=1/2) helper
-  - src/pdxfs.pdx                 # open/read/write/close + TXN begin/commit
-  - src/copy.pdx                  # single-file copy body
-  - src/dispatch.pdx              # positional-count validate + flag gate
-  - src/main.pdx                  # cp_main(argc, argv) entry point
+  - src/print.pdx                 # M1-002 sys_write(fd=1/2) helper
+  - src/dispatch.pdx              # M1-002 flag gate + positional-count validate
+  - src/main.pdx                  # M1-002 cp_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------
 # Only libpdx-argv at M1 (main uses it to parse the argv surface). The
