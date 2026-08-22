@@ -29,6 +29,8 @@ caps_decl   = caps.decl
 #   M1-003 lands: pdxfs, copy (first-runnable single-file copy).
 sources:
   - src/print.pdx                 # M1-002 sys_write(fd=1/2) helper
+  - src/pdxfs.pdx                 # M1-003 open/read/write/close + TXN stubs
+  - src/copy.pdx                  # M1-003 single-file copy body
   - src/dispatch.pdx              # M1-002 flag gate + positional-count validate
   - src/main.pdx                  # M1-002 cp_main(argc, argv) entry point
 

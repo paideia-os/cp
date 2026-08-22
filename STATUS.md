@@ -1,11 +1,11 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M1 (design + skeleton) — in progress
+**Current milestone:** M1 (design + skeleton) — complete
 
 ## Milestone map
 
-- **M1 — design + skeleton (in progress).** Scaffold (caps.decl +
+- **M1 — design + skeleton (complete).** Scaffold (caps.decl +
   build manifest — issue #1), argv surface with `[-r|-v|--dry-run|
   --over-existing] <src> <dst>` via libpdx-argv (issue #2), first-
   runnable single-file `cp a b` (issue #3). First-runnable shape:

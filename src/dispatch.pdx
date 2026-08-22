@@ -1,4 +1,4 @@
-// src/dispatch.pdx — cp.M1-002
+// src/dispatch.pdx — cp.M1-002 (bodies) + cp.M1-003 (happy-arm wire)
 // Dispatch module: flag gate + positional-count validate + route.
 //
 // Scope
@@ -12,10 +12,11 @@
 //   1. `-r` present  → RECURSIVE_NOT_YET_MSG on stderr; EXIT 3.
 //                       (Recursive walk lands at M2 per plan §5.6.)
 //   2. pos_count != 2 → USAGE_MSG on stderr; EXIT 2.
-//   3. otherwise      → dispatch to CopyFile::copy_single_file
-//                       (M1-002 stub prints COPY_STUB_MSG and returns
-//                       3; M1-003 replaces the stub arm with the
-//                       real call).
+//   3. otherwise      → CopyFile::copy_single_file(pos_ptrs[0],
+//                       pos_ptrs[1]); its exit code is our exit code.
+//                       (M1-002 initially stubbed this arm with a
+//                       COPY_STUB_MSG print; M1-003 wired the real
+//                       CopyFile::copy_single_file call.)
 //
 // The `-v`, `--dry-run`, and `--over-existing` flags are recognised
 // by libpdx-argv (they appear in ParsedArgs::flag_names[]) but are
@@ -28,8 +29,9 @@
 //   ParsedArgs::flag_count       (libpdx-argv .bss)
 //   ParsedArgs::flag_names       (libpdx-argv .bss, [u64;32])
 //   ParsedArgs::pos_count        (libpdx-argv .bss)
+//   ParsedArgs::pos_ptrs         (libpdx-argv .bss, [u64;32])
+//   CopyFile::copy_single_file   (this repo, src/copy.pdx — M1-003)
 //   Print::print_err             (this repo, src/print.pdx)
-//   (M1-003 adds: CopyFile::copy_single_file)
 //
 // paideia-as compliance
 // ---------------------
@@ -75,12 +77,12 @@ module Dispatch = structure {
     "cp: recursive copy (-r) not yet implemented at M1 (lands at M2)\n"
   pub let RECURSIVE_NOT_YET_MSG_LEN : u64 = 64
 
-  // COPY_STUB_MSG marks the happy-path arm that M1-002 leaves as a
-  // stub. M1-003 replaces the stub print + exit-3 with a real call to
-  // CopyFile::copy_single_file. Kept here at M1-002 so a caller can
-  // wire `cp a b` in a script today; the script gets a clear message
-  // and a distinct exit code rather than a silent success or a
-  // signal.
+  // COPY_STUB_MSG was the M1-002 happy-arm stub. M1-003 replaced the
+  // print + exit-3 call site with a real CopyFile::copy_single_file
+  // call, but the constants stay defined here so a future test or
+  // diagnostic can print the same string without re-declaring it and
+  // so `grep COPY_STUB_MSG` shows both the definition and the M1-003
+  // handoff comment together. No M1-003 code path emits this string.
   pub let COPY_STUB_MSG : [u8; 58] =
     "cp: copy body not implemented at M1-002 (lands at M1-003)\n"
   pub let COPY_STUB_MSG_LEN : u64 = 58
@@ -91,6 +93,12 @@ module Dispatch = structure {
   // Values: 0 = none, 1 = single-file copy (happy path), 2 = usage,
   // 3 = recursive-not-yet.
   pub let mut chosen_arm : u64 = uninit @align(8)
+
+  // -- Arm identifiers --------------------------------------------------
+  pub let ARM_NONE            : u64 = 0
+  pub let ARM_SINGLE_FILE     : u64 = 1
+  pub let ARM_USAGE           : u64 = 2
+  pub let ARM_RECURSIVE_NYI   : u64 = 3
 
   // ============================================================================
   // dispatch_reset()
@@ -127,9 +135,11 @@ module Dispatch = structure {
   //           (flag_count loaded once at the top), rdi as the current
   //           flag name pointer. r11 is scratch for every lea.
   //   Step 2: load ParsedArgs::pos_count. If != 2 → USAGE arm.
-  //   Step 3: happy path. M1-002 STUB: print COPY_STUB_MSG on stderr
-  //           and return 3. M1-003 replaces this arm with a real call
-  //           to CopyFile::copy_single_file(pos_ptrs[0], pos_ptrs[1]).
+  //   Step 3: happy path. Load pos_ptrs[0] (src) into rdi and
+  //           pos_ptrs[1] (dst) into rsi, then tail-into
+  //           CopyFile::copy_single_file whose exit code becomes our
+  //           own. M1-002 originally stubbed this arm with
+  //           COPY_STUB_MSG + EXIT 3; M1-003 wired the real call.
   //
   // Prologue: 1 push (rbx). rsp%16 was 8 on entry (SysV call), one
   // push brings it to 0 for the nested Print::print_err calls. rbx
@@ -148,7 +158,7 @@ module Dispatch = structure {
   pub let dispatch_copy : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M1-002 dispatch_copy. Walk ParsedArgs::flag_names[] looking for 'r\\0' (short -r flag); on hit exit 3 with RECURSIVE_NOT_YET_MSG. Otherwise gate on ParsedArgs::pos_count == 2; on !=2 exit 2 with USAGE_MSG. Otherwise (M1-002 stub) print COPY_STUB_MSG and exit 3 — M1-003 replaces this arm with a real CopyFile::copy_single_file call. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested Print::print_err calls. rbx preserved for M1-003 shape parity. The -r walk uses r10 as index, rcx as loop bound (flag_count loaded once), rdi as current flag pointer; the two-byte compare uses xor rax,rax; mov_b rax,[rdi/rdi+1] per the #1248 mitigation. Every cmp uses an immediate ≤ 0x7F (single-byte char codes). Every fail arm structure is print+pop+exit-code+ret so rax carries the exit code out cleanly.",
+      justification: "cp.M1-002 dispatch_copy body + cp.M1-003 happy-arm wire. Walk ParsedArgs::flag_names[] looking for 'r\\0' (short -r flag); on hit exit 3 with RECURSIVE_NOT_YET_MSG. Otherwise gate on ParsedArgs::pos_count == 2; on !=2 exit 2 with USAGE_MSG. Otherwise (M1-003 real): load pos_ptrs[0] (src) and pos_ptrs[1] (dst) into SysV args and call CopyFile::copy_single_file, adopting its exit code as ours. 1-push prologue (rbx) aligns rsp%16 to 0 for the nested Print::print_err calls (recursive-nyi + usage arms) and the CopyFile::copy_single_file call (happy arm). rbx unused body-side. The -r walk uses r10 as index, rcx as loop bound (flag_count loaded once), rdi as current flag pointer; the two-byte compare uses xor rax,rax; mov_b rax,[rdi/rdi+1] per the #1248 mitigation. Every cmp uses an immediate ≤ 0x7F (single-byte char codes). Every fail arm structure is print+pop+exit-code+ret so rax carries the exit code out cleanly; the happy arm is pos_ptrs-load+call+pop+ret so CopyFile's rax passes through untouched.",
       block: {
         push rbx;
 
@@ -197,25 +207,23 @@ module Dispatch = structure {
         cmp rax, 2;
         jne dispatch_usage_error;
 
-        // ---- Step 3: happy path (M1-002 STUB) ----
-        // M1-003 replaces this arm with:
-        //   lea r11, [rip + ParsedArgs::pos_ptrs];
-        //   mov rdi, [r11 + 0];                  // src
-        //   mov rsi, [r11 + 8];                  // dst
-        //   call CopyFile::copy_single_file;
-        //   pop rbx;
-        //   ret
-        // No other line in this function changes at M1-003.
-        mov rax, 1;
+        // ---- Step 3: happy path (M1-003 REAL) ----
+        // Load pos_ptrs[0] (src) into rdi and pos_ptrs[1] (dst) into
+        // rsi, then tail-into CopyFile::copy_single_file whose exit
+        // code we adopt as our own. Note the ARM_SINGLE_FILE tag write
+        // to chosen_arm precedes the call so an audit hook added at
+        // M3-002 can name the op before any output byte.
+        mov rax, 1;                            // ARM_SINGLE_FILE
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
 
-        lea rdi, [rip + COPY_STUB_MSG];
-        mov rsi, 58;                           // COPY_STUB_MSG_LEN
-        call Print::print_err;
+        lea r11, [rip + ParsedArgs::pos_ptrs];
+        mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
+        mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
+        call CopyFile::copy_single_file;
+        // rax now carries CopyFile's exit code (0 or 1).
 
         pop rbx;
-        mov rax, 3;                            // EXIT_NOT_YET_IMPLEMENTED
         ret
 
       dispatch_recursive_not_yet:

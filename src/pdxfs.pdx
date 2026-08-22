@@ -1,0 +1,254 @@
+// src/pdxfs.pdx — cp.M1-003
+// Pdxfs module: syscall trampolines for open/read/write/close +
+// stub trampolines for KIND_PDXFS_TXN begin/commit.
+//
+// Scope
+// -----
+// M1 wraps five paideia-os syscalls behind named entry points so
+// CopyFile::copy_single_file does not have to open-code the
+// SysV → SYSCALL argument marshalling at every call site:
+//
+//   pdxfs_open(path_ptr, flags)     → fd or negative errno   [sysno 2]
+//   pdxfs_read(fd, buf, len)        → n or negative errno    [sysno 0]
+//   pdxfs_write(fd, buf, len)       → n or negative errno    [sysno 1]
+//   pdxfs_close(fd)                 → 0 or negative errno    [sysno 3]
+//   pdxfs_txn_begin()               → 0 (M1 stub; real at M2)
+//   pdxfs_txn_commit()              → 0 (M1 stub; real at M2)
+//
+// The open/read/write/close arity is ≤ 3, so no SysV → SYSCALL r10
+// shuffle is needed (matches the arity-0..3 template in paideia-os's
+// src/user/syscall_shim.pdx and libpdx-audit's src/syscall_shim.pdx).
+// All four are straight-line trampolines: `mov rax, N; syscall; ret`
+// (or `mov rax, N-with-mode-arg; syscall; ret` for open).
+//
+// The two transaction wrappers are stubs at M1 because the kernel's
+// KIND_PDXFS_TXN substrate at HEAD (2026-08-21) landed the derived-
+// kind + witness only — `sys_pdxfs_txn_begin` and
+// `sys_pdxfs_txn_commit` are not yet exposed. Both stubs return 0
+// unconditionally so callers can wire the begin/commit pair around
+// their real work today and get the atomicity guarantee at M2 by
+// upgrading only the two bodies here. This matches pkg's M1 pattern
+// where `PkgList::pkg_list_enumerate` is a stub that returns 0
+// pending the readdir substrate.
+//
+// Open flag conventions
+// ---------------------
+// paideia-os exposes O_CREAT = 0x40 (bit 6) at
+// src/kernel/core/fs/vfs_open.pdx L36. Access modes follow the POSIX
+// convention: O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Only O_CREAT is
+// gate-checked at the substrate today; the access-mode bits are
+// forwarded to the vnode ops verbatim.
+//
+// The `mode` argument to open (permission bits) is IGNORED by the
+// current substrate per the sys_open contract comment
+// (src/kernel/core/syscall/handlers/sys_open.pdx L18); pdxfs_open
+// passes 0 for it. When the substrate starts honouring mode, cp's
+// caller can either pass a mode explicitly (signature edit) or keep
+// the default 0644 the substrate itself will pick.
+//
+// Error convention
+// ----------------
+// Every syscall in paideia-os returns a negative-errno u64 on failure
+// (bit 63 set). Callers use `cmp rax, 0; jl err` to branch on any
+// error class in one instruction (this is the discipline the kernel
+// dispatch documents at src/kernel/core/syscall/dispatch.pdx L129).
+// Successful returns are always non-negative:
+//   open  → fd in [3, 32)
+//   read  → bytes_read in [0, len]  (0 == EOF)
+//   write → bytes_written in [0, len]  (short write possible on quota)
+//   close → 0
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Pdxfs (PascalCase basename).
+//   - No test mnemonic. Leaf trampolines; no zero-check needed here.
+//   - r11 is scratch; unused in every entry point (leaves).
+//   - Leaf functions: no callee-save touched, no push/pop parity to
+//     preserve. rsp % 16 == 8 on entry stays 8 through the syscall;
+//     the kernel dispatch handles that.
+
+module Pdxfs = structure {
+
+  // -- Syscall ids (mirror paideia-os src/kernel/core/syscall/dispatch.pdx L256-263) --
+  pub let SYSCALL_READ   : u64 = 0
+  pub let SYSCALL_WRITE  : u64 = 1
+  pub let SYSCALL_OPEN   : u64 = 2
+  pub let SYSCALL_CLOSE  : u64 = 3
+
+  // -- Open flag constants (mirror src/kernel/core/fs/vfs_open.pdx L36-38) --
+  // Access modes: POSIX-conventional; 0 for read-only, 1 for write-only,
+  // 2 for read-write. The paideia-os substrate accepts these values but
+  // does not yet enforce them at the vnode level — sys_open forwards
+  // the flags word to vfs_open which reads only O_CREAT (bit 6). Kept
+  // here as documented constants so cp's copy body reads by name
+  // rather than by magic number.
+  pub let O_RDONLY : u64 = 0
+  pub let O_WRONLY : u64 = 1
+  pub let O_RDWR   : u64 = 2
+  pub let O_CREAT  : u64 = 0x40    // bit 6 — from vfs_open.pdx
+  pub let O_TRUNC  : u64 = 0x80    // bit 7 — deferred by kernel to R16.M2
+  pub let O_APPEND : u64 = 0x200   // bit 9 — deferred by kernel to R16.M3
+
+  // -- Return codes for the txn stubs (M1) --
+  // Both begin and commit return 0 (success) unconditionally at M1.
+  // The reserved slots below are the shape the M2 upgrade will start
+  // returning; documented here so the caller's error-handling
+  // structure is future-proof.
+  pub let PDXFS_TXN_OK               : u64 = 0
+  pub let PDXFS_TXN_ERR_NOT_YET      : u64 = 0xFFFFFFFFFFFFFFE0   // -32 (ENOSYS placeholder)
+
+  // ============================================================================
+  // pdxfs_open(path_ptr, flags) -> fd_or_errno
+  //
+  // Signature: pdxfs_open : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): path_ptr — VA of a NUL-terminated ASCII path
+  // RSI (input): flags    — bitmask (see O_* constants above)
+  // RAX (output): fd on success; negative-errno u64 on failure
+  //
+  // The mode argument to sys_open is set to 0 here — the substrate
+  // ignores it (see the sys_open comment at
+  // src/kernel/core/syscall/handlers/sys_open.pdx L18). When the
+  // substrate starts honouring mode, either extend this trampoline's
+  // signature or add a `pdxfs_open_mode` variant.
+  //
+  // Register plan (leaf; SysV arg 3 = rdx which we write, no r10
+  // shuffle because arity is 3):
+  //   rax = SYSCALL_OPEN then syscall return
+  //   rdi = path_ptr (from caller)
+  //   rsi = flags (from caller)
+  //   rdx = mode (set to 0 here)
+  // ============================================================================
+  pub let pdxfs_open : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_open. Trampoline for paideia-os sysno 2 (sys_open). SysV arg1=rdi(path_ptr), arg2=rsi(flags); syscall wants arg1=rdi(path), arg2=rsi(flags), arg3=rdx(mode). Arity 3 < 4 so no r10 shuffle. Mode set to 0 explicitly because caller does not supply it (substrate at HEAD ignores mode per sys_open.pdx L18); when the substrate honours mode either extend this signature or add a pdxfs_open_mode variant. Return value is verbatim from the syscall: fd on success (in [3, 32)) or a negative-errno u64 (SYS_OPEN_ERR_ENOENT = -2, SYS_OPEN_ERR_EMFILE = -24). sysreg effect declared because syscall clobbers rcx and r11 per the x86_64 SYSRET convention. Leaf.",
+      block: {
+        mov rdx, 0;                            // mode = 0 (ignored by substrate)
+        mov rax, 2;                            // SYSCALL_OPEN
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_read(fd, buf_ptr, len) -> bytes_or_errno
+  //
+  // Signature: pdxfs_read : (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): fd       — file descriptor in [3, 32)
+  // RSI (input): buf_ptr  — destination buffer VA
+  // RDX (input): len      — bytes to read
+  // RAX (output): bytes_read in [0, len] on success (0 == EOF);
+  //               SYS_READ_ERR_EBADF (-9) if fd invalid;
+  //               SYS_READ_ERR_EIO   (-5) on vfs_read sentinel.
+  //
+  // SysV → SYSCALL: arity 3, no r10 shuffle.
+  // ============================================================================
+  pub let pdxfs_read : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_read. Trampoline for paideia-os sysno 0 (sys_read). SysV arg1=rdi(fd), arg2=rsi(buf), arg3=rdx(len); syscall wants same shape (arity 3). No r10 shuffle. Return value verbatim: bytes_read in [0, len] on success (0 == EOF is a valid non-error return the caller uses as its loop-exit condition); negative-errno u64 on failure (SYS_READ_ERR_EBADF = -9, SYS_READ_ERR_EIO = -5). Callers gate with cmp rax, 0; jl err after reading the return (same convention as the kernel dispatch's error-branching idiom, src/kernel/core/syscall/dispatch.pdx L129). Leaf; sysreg effect for syscall clobber.",
+      block: {
+        mov rax, 0;                            // SYSCALL_READ
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_write(fd, buf_ptr, len) -> bytes_or_errno
+  //
+  // Signature: pdxfs_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): fd       — file descriptor in [3, 32)
+  // RSI (input): buf_ptr  — source buffer VA
+  // RDX (input): len      — bytes to write
+  // RAX (output): bytes_written in [0, len] on success (short write
+  //               possible on quota); negative-errno on failure.
+  //
+  // SysV → SYSCALL: arity 3, no r10 shuffle. sys_write is sysno 1.
+  // ============================================================================
+  pub let pdxfs_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_write. Trampoline for paideia-os sysno 1 (sys_write). SysV arg1=rdi(fd), arg2=rsi(buf), arg3=rdx(len); syscall wants same shape (arity 3). No r10 shuffle. Return value verbatim: bytes_written in [0, len] on success (short-write is a legal non-error return the caller must handle); negative-errno u64 on failure (SYS_WRITE_ERR_EBADF = -9, SYS_WRITE_ERR_EIO = -5). Same fast-path as pkg's Print helper — this trampoline is called with a real file fd, not fd 1 / 2, so the kernel takes the vnode write path rather than the UART fast-path. Leaf; sysreg effect for syscall clobber.",
+      block: {
+        mov rax, 1;                            // SYSCALL_WRITE
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_close(fd) -> 0_or_errno
+  //
+  // Signature: pdxfs_close : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): fd — file descriptor in [3, 32)
+  // RAX (output): 0 on success; SYS_CLOSE_ERR_EBADF (-9) on invalid fd.
+  //
+  // Arity 1; syscall is sysno 3.
+  // ============================================================================
+  pub let pdxfs_close : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_close. Trampoline for paideia-os sysno 3 (sys_close). Arity 1; no register shuffle. Return: 0 on success, SYS_CLOSE_ERR_EBADF = -9 on invalid fd. cp's copy body ignores the return in the normal-exit path (any close error is a driver-level anomaly out of cp's control; the fd is released either way at task teardown). Leaf; sysreg effect for syscall clobber.",
+      block: {
+        mov rax, 3;                            // SYSCALL_CLOSE
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_begin() -> 0 (M1 STUB)
+  //
+  // Signature: pdxfs_txn_begin : () -> u64 !{mem} @{}
+  // RAX (output): PDXFS_TXN_OK (0)
+  //
+  // M1 STUB. Always returns 0. The real body (M2) binds a
+  // KIND_PDXFS_TXN cap from the InitCap sidecar and issues the
+  // sys_pdxfs_txn_begin syscall the R42 substrate will expose; the
+  // return value becomes a txn handle stored in a .bss slot for the
+  // matching commit call. cp.M2 lands both this body and the
+  // sys_pdxfs_txn_begin dispatch entry in paideia-os.
+  //
+  // Kept as a distinct entry point at M1 so cp's copy body can wire
+  // the begin/commit pair around the real work today and get the
+  // atomicity guarantee at M2 by upgrading only these two bodies
+  // (no restructure of copy.pdx).
+  //
+  // Leaf; r11 scratch; no state written at M1.
+  // ============================================================================
+  pub let pdxfs_txn_begin : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_txn_begin M1 STUB. Always returns 0. The real body (M2) binds a KIND_PDXFS_TXN cap from the InitCap sidecar and issues sys_pdxfs_txn_begin against the R42 substrate (which at HEAD landed the derived-kind + witness only; the syscall is not yet exposed). Kept as a distinct entry point so cp's copy body can wire begin/commit around real work today; the M2 upgrade is a body edit inside pdxfs_txn_begin / pdxfs_txn_commit and does not touch copy.pdx. Leaf; xor rax,rax is one byte cheaper than mov rax,0 and produces the same result.",
+      block: {
+        xor rax, rax;                          // PDXFS_TXN_OK (0)
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_commit() -> 0 (M1 STUB)
+  //
+  // Signature: pdxfs_txn_commit : () -> u64 !{mem} @{}
+  // RAX (output): PDXFS_TXN_OK (0)
+  //
+  // M1 STUB. Always returns 0. See pdxfs_txn_begin.
+  //
+  // At M2 this body issues sys_pdxfs_txn_commit against the txn
+  // handle stashed by begin; commit failure (which would then be a
+  // real possibility, e.g. quota exhaustion revealed only at commit
+  // time) returns a negative errno and the caller aborts.
+  //
+  // Leaf; r11 scratch; no state written at M1.
+  // ============================================================================
+  pub let pdxfs_txn_commit : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M1-003 pdxfs_txn_commit M1 STUB. Always returns 0. Symmetric to pdxfs_txn_begin: M2 issues sys_pdxfs_txn_commit against the txn handle stashed by the begin path. Both bodies land at M2; every M1 call site (currently just CopyFile::copy_single_file) keeps its shape unchanged. Leaf.",
+      block: {
+        xor rax, rax;                          // PDXFS_TXN_OK (0)
+        ret
+      }
+    }
+}

@@ -1,0 +1,375 @@
+// src/copy.pdx — cp.M1-003
+// CopyFile module: single-file copy body.
+//
+// Scope
+// -----
+// M1's first-runnable shape: `cp a b` opens the source read-only,
+// opens the destination with O_CREAT | O_WRONLY, wraps both opens
+// between a pdxfs_txn_begin / pdxfs_txn_commit pair (M1 stubs; real
+// at M2), streams bytes through a 4 KiB .bss scratch buffer until
+// source EOF, closes both fds, commits, and returns 0. On any
+// syscall error, cp prints a one-line diagnostic on stderr, closes
+// whichever fds are open, and returns 1 (EXIT_OP_FAIL).
+//
+// The TXN pair at M1 does nothing (stub returns 0 unconditionally,
+// see src/pdxfs.pdx). Wrapping the real work between begin/commit at
+// M1 is deliberate: the M2 patch that lands the real TXN body needs
+// only to swap the two stub bodies in pdxfs.pdx — no restructure of
+// this file. At M2, an error path inside the read/write loop will
+// gain a pdxfs_txn_abort() call before its print+return; today the
+// abort is a no-op that we do not bother inserting.
+//
+// Storage model
+// -------------
+// A 4 KiB scratch buffer lives in .bss (COPY_BUF). Each loop iteration
+// does one pdxfs_read into it and one pdxfs_write out of it; the
+// syscall count for a copy of N bytes is roughly 2 * ceil(N / 4096) +
+// two opens + two closes + two txn calls. A 1 MiB file is ~514 total
+// syscalls at M1.
+//
+// The two fd slots (fd_src, fd_dst) and the running bytes_copied
+// counter also live in .bss. All three are singleton (one cp
+// invocation is one copy).
+//
+// Register plan
+// -------------
+// 5-push prologue (rbx, r12, r13, r14, r15) lands rsp%16 == 0 at
+// every nested call site. Every long-lived value crosses at least one
+// pdxfs_* call and therefore lives in a callee-save reg:
+//   rbx = src_ptr    (input; preserved across every call)
+//   r12 = dst_ptr    (input; preserved across every call)
+//   r13 = fd_src     (from pdxfs_open; preserved across every call)
+//   r14 = fd_dst     (from pdxfs_open; preserved across every call)
+//   r15 = last_n     (bytes returned by the current pdxfs_read; needed
+//                     as the write-length for the matching pdxfs_write
+//                     and as the short-write comparison target)
+// Scratch: rax (return), rcx (bytes_copied accumulator load/store), rdi,
+// rsi, rdx (syscall args), r11 (every lea).
+//
+// Cross-module externs consumed
+// -----------------------------
+//   Pdxfs::pdxfs_open, pdxfs_read, pdxfs_write, pdxfs_close
+//   Pdxfs::pdxfs_txn_begin, pdxfs_txn_commit
+//   Print::print_err
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CopyFile (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest is COPY_BUF_LEN = 4096).
+//     The negative-errno detection uses `cmp rax, 0; jl` (signed
+//     compare against 0) which sets the SF flag from bit 63 of rax
+//     without staging the negative sentinel as an immediate.
+//   - r11 is scratch; used in every lea for .bss/.rodata addresses.
+//   - Byte loads not needed here (copy body reads and writes at word
+//     granularity through syscall boundaries; no byte-load pattern).
+//   - 5-push prologue, rsp%16 == 0 at every nested call site; matching
+//     5-pop epilogue with rax carrying the exit code.
+
+module CopyFile = structure {
+
+  // -- Buffer + counter storage ----------------------------------------
+  // COPY_BUF_LEN kept at 4096 for a good syscall-count / .bss-pressure
+  // trade-off. A larger buffer amortises the syscall overhead but pins
+  // more .bss for a small-file-typical workload; 4 KiB matches the
+  // typical page-size fingerprint.
+  pub let COPY_BUF_LEN : u64 = 4096
+
+  pub let mut copy_buf     : [u8; 4096] = uninit @align(8)
+  pub let mut fd_src       : u64        = uninit @align(8)
+  pub let mut fd_dst       : u64        = uninit @align(8)
+  pub let mut bytes_copied : u64        = uninit @align(8)
+
+  // -- Diagnostic strings ---------------------------------------------
+  // Every error path prints one line on stderr and returns 1. Kept
+  // small so a script's stderr capture stays scannable; M3 replaces
+  // these with libpdx-audit records that carry structured fields.
+  pub let OPEN_SRC_FAIL_MSG : [u8; 28] =
+    "cp: cannot open source file\n"
+  pub let OPEN_SRC_FAIL_MSG_LEN : u64 = 28
+
+  pub let OPEN_DST_FAIL_MSG : [u8; 33] =
+    "cp: cannot open destination file\n"
+  pub let OPEN_DST_FAIL_MSG_LEN : u64 = 33
+
+  pub let READ_FAIL_MSG : [u8; 28] =
+    "cp: read from source failed\n"
+  pub let READ_FAIL_MSG_LEN : u64 = 28
+
+  pub let WRITE_FAIL_MSG : [u8; 32] =
+    "cp: write to destination failed\n"
+  pub let WRITE_FAIL_MSG_LEN : u64 = 32
+
+  pub let SHORT_WRITE_MSG : [u8; 47] =
+    "cp: short write to destination (partial state)\n"
+  pub let SHORT_WRITE_MSG_LEN : u64 = 47
+
+  // These two are unreachable at M1 (pdxfs_txn_begin / _commit return 0
+  // unconditionally) but present so the M2 upgrade is a body edit in
+  // pdxfs.pdx rather than a structural edit here.
+  pub let TXN_BEGIN_FAIL_MSG : [u8; 29] =
+    "cp: transaction begin failed\n"
+  pub let TXN_BEGIN_FAIL_MSG_LEN : u64 = 29
+
+  pub let TXN_COMMIT_FAIL_MSG : [u8; 30] =
+    "cp: transaction commit failed\n"
+  pub let TXN_COMMIT_FAIL_MSG_LEN : u64 = 30
+
+  // ============================================================================
+  // copy_reset()
+  //
+  // Signature: copy_reset : () -> () !{mem} @{}
+  //
+  // Clear the three .bss slots (fd_src, fd_dst, bytes_copied) so a
+  // subsequent copy_single_file call starts from a known-zero
+  // baseline. copy_buf is index-consumed (every write is preceded by
+  // a read that overwrites it) so it does not need zeroing.
+  //
+  // Leaf; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let copy_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M1-003 copy_reset. Zero the three .bss counter slots (fd_src, fd_dst, bytes_copied) so copy_single_file starts from a known baseline. copy_buf is index-consumed so trailing bytes do not need zeroing (same idiom as ParsedArgs::reset in libpdx-argv and PkgList::list_reset in pkg). r11 is scratch used only for the three leas. Leaf.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + fd_src];       mov [r11], rax;
+        lea r11, [rip + fd_dst];       mov [r11], rax;
+        lea r11, [rip + bytes_copied]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // copy_single_file(src_ptr, dst_ptr) -> exit_code
+  //
+  // Signature: copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): src_ptr — VA of a NUL-terminated source path
+  // RSI (input): dst_ptr — VA of a NUL-terminated destination path
+  // RAX (output): 0 on success, 1 on any syscall error
+  //
+  // Body flow:
+  //   1. copy_reset
+  //   2. pdxfs_txn_begin — M1 stub; the return is checked so the M2
+  //      body-edit does not have to add a check-site.
+  //   3. pdxfs_open(src_ptr, O_RDONLY = 0)         → r13 = fd_src
+  //   4. pdxfs_open(dst_ptr, O_WRONLY|O_CREAT = 0x41) → r14 = fd_dst
+  //   5. Read/write loop until source EOF (n == 0).
+  //   6. Close dst, close src (return codes ignored — an fd release
+  //      error is not something cp's caller can act on).
+  //   7. pdxfs_txn_commit — M1 stub; the return is checked so M2's
+  //      real commit path has a landing site.
+  //   8. Return 0.
+  //
+  // Error branches
+  // --------------
+  //   copy_txn_begin_fail    — before any open; print + return 1.
+  //   copy_open_src_fail     — no fds open; print + return 1.
+  //   copy_open_dst_fail     — close fd_src; print + return 1.
+  //   copy_read_fail         — close fd_dst + fd_src; print + return 1.
+  //   copy_write_fail        — close fd_dst + fd_src; print + return 1.
+  //   copy_short_write       — close fd_dst + fd_src; print + return 1.
+  //   copy_txn_commit_fail   — fds already closed on success arm;
+  //                             print + return 1. Unreachable at M1
+  //                             (stub returns 0) but present for M2.
+  //
+  // Every error branch shares a single copy_epilogue so the 5-pop
+  // teardown is expressed once.
+  //
+  // M2 will add pdxfs_txn_abort() before the return in each error
+  // branch; today the abort is a no-op that would only add call
+  // instructions with no observable effect. The plan doc §5.6 M2
+  // line calls this out as the "single-TXN atomicity across whole
+  // invocation (partial rollback)" landing.
+  // ============================================================================
+  pub let copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M1-003 copy_single_file. First-runnable single-file copy: open src (O_RDONLY=0), open dst (O_WRONLY|O_CREAT=0x41), stream through 4KiB .bss buffer copy_buf until EOF, close both, commit TXN, return 0. TXN begin/commit are M1 stubs in Pdxfs (return 0 unconditionally) — wrapping real work between them is deliberate so the M2 patch changes only Pdxfs bodies, no restructure here. 5-push prologue (rbx=src_ptr, r12=dst_ptr, r13=fd_src, r14=fd_dst, r15=last_n) lands rsp%16==0 at every nested call site; every long-lived value crosses at least one pdxfs_* call and therefore lives in a callee-save reg. Error path structure: seven distinct branches (copy_txn_begin_fail / copy_open_src_fail / copy_open_dst_fail / copy_read_fail / copy_write_fail / copy_short_write / copy_txn_commit_fail) each close whatever fds are open (0/1/2 fds depending on where the error hit), print one line on stderr via Print::print_err, and jump to copy_epilogue which restores the 5-push callee-save state and returns with rax=1 (EXIT_OP_FAIL). Success path returns via xor rax,rax; jmp copy_epilogue. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF: 0 (zero checks), 0x40 (O_CREAT), 0x41 (O_WRONLY|O_CREAT), 4096 (COPY_BUF_LEN). Negative-errno detection uses `cmp rax, 0; jl` (signed compare — SF set from rax bit 63) so the u64 sentinel does not need immediate staging. The bytes_copied accumulator uses r11+rcx: lea r11 to bytes_copied; mov rcx, [r11]; add rcx, rax; mov [r11], rcx — three-instruction read-modify-write with r11 scratch discipline. sysreg effect declared for the syscall clobber shape.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+        push r14;                              // rsp%16: 0 → 8
+        push r15;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = src_ptr
+        mov r12, rsi;                          // r12 = dst_ptr
+
+        // ---- Step 1: reset state --------------------------------------------
+        call CopyFile::copy_reset;
+
+        // ---- Step 2: begin TXN (M1 stub returns 0) --------------------------
+        call Pdxfs::pdxfs_txn_begin;
+        cmp rax, 0;
+        jl copy_txn_begin_fail;
+
+        // ---- Step 3: open source (O_RDONLY = 0) -----------------------------
+        mov rdi, rbx;                          // src_ptr
+        mov rsi, 0;                            // O_RDONLY
+        call Pdxfs::pdxfs_open;
+        cmp rax, 0;
+        jl copy_open_src_fail;
+
+        mov r13, rax;                          // r13 = fd_src
+        lea r11, [rip + fd_src];
+        mov [r11], rax;
+
+        // ---- Step 4: open destination (O_WRONLY | O_CREAT = 0x41) -----------
+        mov rdi, r12;                          // dst_ptr
+        mov rsi, 0x41;                         // O_WRONLY | O_CREAT
+        call Pdxfs::pdxfs_open;
+        cmp rax, 0;
+        jl copy_open_dst_fail;
+
+        mov r14, rax;                          // r14 = fd_dst
+        lea r11, [rip + fd_dst];
+        mov [r11], rax;
+
+        // ---- Step 5: read/write loop ----------------------------------------
+      copy_loop_head:
+        // pdxfs_read(fd_src, copy_buf, COPY_BUF_LEN)
+        mov rdi, r13;                          // fd_src
+        lea rsi, [rip + copy_buf];             // buf
+        mov rdx, 4096;                         // COPY_BUF_LEN
+        call Pdxfs::pdxfs_read;
+
+        cmp rax, 0;
+        jl copy_read_fail;                     // negative errno → error
+        je copy_eof;                           // n == 0 → source EOF, done
+
+        mov r15, rax;                          // r15 = n (bytes read)
+
+        // pdxfs_write(fd_dst, copy_buf, n)
+        mov rdi, r14;                          // fd_dst
+        lea rsi, [rip + copy_buf];             // buf
+        mov rdx, r15;                          // len = n
+        call Pdxfs::pdxfs_write;
+
+        cmp rax, 0;
+        jl copy_write_fail;                    // negative errno → error
+
+        cmp rax, r15;                          // bytes_written < n?
+        jl copy_short_write;                   // yes → short-write error
+
+        // Accumulate bytes_copied += rax.
+        lea r11, [rip + bytes_copied];
+        mov rcx, [r11];
+        add rcx, rax;
+        mov [r11], rcx;
+
+        jmp copy_loop_head;
+
+        // ---- Step 6+7+8: success epilogue (EOF, close, commit, return 0) ----
+      copy_eof:
+        // Close dst first, then src. Return values ignored (a close
+        // error on the M1 substrate is not something the caller can
+        // do anything about; the fd is released at task teardown
+        // regardless).
+        mov rdi, r14;
+        call Pdxfs::pdxfs_close;
+
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        // Commit TXN (M1 stub returns 0).
+        call Pdxfs::pdxfs_txn_commit;
+        cmp rax, 0;
+        jl copy_txn_commit_fail;
+
+        xor rax, rax;                          // EXIT_OK (0)
+        jmp copy_epilogue;
+
+        // ---- Error branches -------------------------------------------------
+        // Ordered by "how many fds are open at this point":
+        //   0 fds: copy_txn_begin_fail, copy_open_src_fail
+        //   1 fd  (fd_src): copy_open_dst_fail
+        //   2 fds:          copy_read_fail, copy_write_fail, copy_short_write
+        //   2 fds already closed: copy_txn_commit_fail
+        //
+        // M2 will add a pdxfs_txn_abort() call before each print here
+        // once that entry point exists in Pdxfs; today the abort is a
+        // no-op so it is omitted.
+      copy_txn_begin_fail:
+        lea rdi, [rip + TXN_BEGIN_FAIL_MSG];
+        mov rsi, 29;                           // TXN_BEGIN_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;                            // EXIT_OP_FAIL
+        jmp copy_epilogue;
+
+      copy_open_src_fail:
+        lea rdi, [rip + OPEN_SRC_FAIL_MSG];
+        mov rsi, 28;                           // OPEN_SRC_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_open_dst_fail:
+        // fd_src is open; close it before we return.
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        lea rdi, [rip + OPEN_DST_FAIL_MSG];
+        mov rsi, 33;                           // OPEN_DST_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_read_fail:
+        mov rdi, r14;
+        call Pdxfs::pdxfs_close;
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        lea rdi, [rip + READ_FAIL_MSG];
+        mov rsi, 28;                           // READ_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_write_fail:
+        mov rdi, r14;
+        call Pdxfs::pdxfs_close;
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        lea rdi, [rip + WRITE_FAIL_MSG];
+        mov rsi, 32;                           // WRITE_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_short_write:
+        mov rdi, r14;
+        call Pdxfs::pdxfs_close;
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        lea rdi, [rip + SHORT_WRITE_MSG];
+        mov rsi, 47;                           // SHORT_WRITE_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_txn_commit_fail:
+        // fds already closed on the success arm before commit was
+        // attempted; nothing to close here. Unreachable at M1
+        // (stub returns 0) but present for M2.
+        lea rdi, [rip + TXN_COMMIT_FAIL_MSG];
+        mov rsi, 30;                           // TXN_COMMIT_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp copy_epilogue;
+
+        // ---- Shared epilogue ------------------------------------------------
+      copy_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
