@@ -280,7 +280,8 @@ module CopyFile = structure {
 
         jmp copy_loop_head;
 
-        // ---- Step 5+6: success epilogue (EOF, close, return 0) --------------
+        // ---- Step 5+6+7: success epilogue -----------------------------------
+        // (EOF, close fds, preserve dst cap-tail, return 0)
       copy_eof:
         // Close dst first, then src. Return values ignored (a close
         // error on the M2 substrate is not something the caller can
@@ -291,6 +292,18 @@ module CopyFile = structure {
 
         mov rdi, r13;
         call Pdxfs::pdxfs_close;
+
+        // ---- Step 7 (M2-002): preserve destination cap-tail -----------------
+        // Attempt to re-sign the destination inode under the invoker's
+        // user_sk. SI_OK (0) and SI_DEGRADED_KEY_LOCKED (1) are both
+        // success-continuation codes — the file bytes are copied either
+        // way, only the inode signature differs. SI_ERROR (0xFFFFFFFF)
+        // is fatal but the M2 stub never returns it (libpdx-cap.M3 body
+        // edit lands the real re-sign path along with the SI_ERROR
+        // failure mode). Consequently no return-code gate is needed
+        // here at M2 — the call is fire-and-continue.
+        mov rdi, r12;                          // dst_ptr
+        call SignedInode::preserve_at_destination;
 
         xor rax, rax;                          // EXIT_OK (0)
         jmp copy_epilogue;

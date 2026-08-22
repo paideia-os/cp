@@ -1,0 +1,171 @@
+// src/signed_inode.pdx — cp.M2-002
+// SignedInode module: cap-tail preservation at the destination inode.
+//
+// Scope
+// -----
+// Per `design/user/model.md` §10.2, every PdxFS v1 inode carries a
+// signed cap-tail that binds (owner_user_id, mtime, content_hash) to
+// the inode's fields via an ML-DSA-65 signature over the invoker's
+// `user_sk`. On copy, cp must preserve the "signed by the current
+// invoker" property of the destination — either by re-signing under
+// the invoker's user_sk (happy path), or by gracefully degrading to
+// an unsigned copy when the passphrase is locked (M2-003 wires the
+// `--verbose` diagnostic on that path).
+//
+// M2-002 shape
+// ------------
+// This module ships the API surface + the outer flow. The actual
+// re-sign call needs libpdx-cap.M3's `cap_sign_inode` helper, which
+// has NOT landed yet — cp.M2's cross-repo dep is on libpdx-cap.M3
+// per plan §5.6. Until then this file stubs the re-sign body: every
+// call returns SI_DEGRADED_KEY_LOCKED (the "invoker's passphrase is
+// not currently unlocked" leaf of the decision tree), which the
+// caller either ignores (M2-002) or emits a `--verbose` diagnostic
+// for (M2-003 body-edit in this same module).
+//
+// The M2-002 stub is deliberately loud in the design/architecture
+// note but silent at runtime — a downstream test asserting "cp
+// preserved the cap-tail" will need libpdx-cap.M3 before it can
+// pass. When libpdx-cap.M3 lands, only `preserve_at_destination`'s
+// body flips to the real re-sign call sequence; every call site
+// (CopyFile::copy_bytes_only after a successful copy, and
+// Walk::walk_recursive per entry once its walk_entry_todo body lands)
+// stays unchanged.
+//
+// Return codes
+// ------------
+//   SI_OK                  = 0                — re-sign succeeded
+//   SI_DEGRADED_KEY_LOCKED = 1                — invoker's user_sk is
+//                                                sealed; copy remains
+//                                                but destination is
+//                                                unsigned. NOT an error;
+//                                                caller continues.
+//   SI_ERROR               = 0xFFFFFFFF       — real sign attempt failed
+//                                                (unavailable at M2 stub;
+//                                                reserved for libpdx-
+//                                                cap.M3 body-edit).
+//
+// Caller contract
+// ---------------
+// SI_OK and SI_DEGRADED_KEY_LOCKED are BOTH success-continuation
+// codes — the file bytes are copied either way, only the inode
+// signature differs. Only SI_ERROR causes the outer copy to return
+// EXIT_OP_FAIL. This matches design/user/model.md §10.2's "signed-
+// inode preservation is best-effort at cp — the outer TXN atomicity
+// guarantees the byte content is coherent regardless of signature
+// state".
+//
+// Call sites (M2)
+// ---------------
+//   CopyFile::copy_bytes_only  — one call after the read/write loop
+//                                completes successfully, before the
+//                                close-fds/success-return sequence.
+//   Walk::walk_recursive       — one call per regular-file entry
+//                                inside walk_entry_todo (that body
+//                                lands with the R42 readdir substrate).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module SignedInode (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest: 1 for SI_DEGRADED;
+//     0xFFFFFFFF for SI_ERROR is loaded via mov reg, imm not compared).
+//   - r11 is scratch (used only for the .bss slot lea in the counter
+//     bump).
+//   - preserve_at_destination is a leaf at M2 stub (no calls); when
+//     libpdx-cap.M3 lands it becomes non-leaf and gains a 1-push
+//     prologue then.
+
+module SignedInode = structure {
+
+  // -- Return codes (see file header for semantics) --------------------
+  pub let SI_OK                  : u64 = 0
+  pub let SI_DEGRADED_KEY_LOCKED : u64 = 1
+  pub let SI_ERROR               : u64 = 0xFFFFFFFF
+
+  // -- Counter slot. Bumped every time preserve_at_destination fires;
+  // -- used by future M4 tests to assert "we called the preservation
+  // -- helper N times for N-file cp -r". Zero'd by signed_inode_reset.
+  pub let mut preserve_calls    : u64 = uninit @align(8)
+  pub let mut preserve_degrades : u64 = uninit @align(8)
+
+  // ============================================================================
+  // signed_inode_reset()
+  //
+  // Signature: signed_inode_reset : () -> () !{mem} @{}
+  //
+  // Zero the counter slots so a subsequent cp invocation starts from
+  // a known baseline. Called at the top of Dispatch::dispatch_copy in
+  // future revisions; not called at M2-002 (counters accumulate across
+  // dispatch calls, which is fine for one process = one invocation).
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let signed_inode_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-002 SignedInode::signed_inode_reset. Zero the two counter slots (preserve_calls, preserve_degrades). Leaf; r11 scratch; mirror of CopyFile::copy_reset shape.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + preserve_calls];    mov [r11], rax;
+        lea r11, [rip + preserve_degrades]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // preserve_at_destination(dst_ptr) -> rc
+  //
+  // Signature: preserve_at_destination : (u64) -> u64 !{mem} @{}
+  // RDI (input): dst_ptr — VA of a NUL-terminated destination path
+  // RAX (output): SI_OK | SI_DEGRADED_KEY_LOCKED | SI_ERROR
+  //
+  // M2 STUB. The libpdx-cap.M3 signed-inode helpers are the direct
+  // substrate this call needs (see plan §5.6 cross-repo dep line);
+  // that milestone has not landed. Today this entry:
+  //   1. Bumps preserve_calls.
+  //   2. Attempts the re-sign — currently a no-op that immediately
+  //      determines "invoker's user_sk is not unlocked".
+  //   3. Bumps preserve_degrades.
+  //   4. Returns SI_DEGRADED_KEY_LOCKED.
+  //
+  // The dst_ptr argument is INFORMATIONAL at M2 — the real body will
+  // pass it to libpdx-cap's inode-open helper. Reading it here would
+  // add a memory load without a semantic effect (the path bytes are
+  // not walked, hashed, or signed at M2). The parameter position is
+  // reserved so the M3 body-edit does not change the signature.
+  //
+  // M2-003 body-edit in this same file wires the `--verbose`
+  // diagnostic emit onto the SI_DEGRADED_KEY_LOCKED return path
+  // (reading CpFlags::flag_verbose_seen and calling Print::print_err
+  // when set). M2-002 leaves that path silent so the callers can be
+  // wired without a new stderr surface.
+  //
+  // Leaf at M2 (no calls); r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let preserve_at_destination : (u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-002 SignedInode::preserve_at_destination M2 STUB. Bumps preserve_calls (indicates the preservation helper was invoked) then bumps preserve_degrades and returns SI_DEGRADED_KEY_LOCKED (invoker's user_sk sealed / libpdx-cap.M3 not landed). The dst_ptr argument is informational — the real body (post libpdx-cap.M3) will pass it to cap_sign_inode(dst_ptr, invoker_user_sk); reading it here would be work without semantic effect. Leaf; r11 scratch for the two counter bumps (three-instruction read-modify-write per counter with r11 as .bss address holder). paideia-as compliance: no test, no large immediates, xor rax,rax for zero, mov rax, 1 for the SI_DEGRADED_KEY_LOCKED constant. When libpdx-cap.M3 lands, this body edits to call cap_sign_inode and only returns SI_DEGRADED_KEY_LOCKED when the key-lock check reports unlocked; every caller keeps its shape.",
+      block: {
+        // Bump preserve_calls: [preserve_calls] += 1.
+        lea r11, [rip + preserve_calls];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // (M3 body-edit lands here — call cap_sign_inode(dst_ptr,
+        // invoker_user_sk). Today: fall through to the degrade path.)
+
+        // Bump preserve_degrades: [preserve_degrades] += 1.
+        lea r11, [rip + preserve_degrades];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Return SI_DEGRADED_KEY_LOCKED.
+        mov rax, 1;                            // SI_DEGRADED_KEY_LOCKED
+        ret
+      }
+    }
+}
