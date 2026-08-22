@@ -346,6 +346,47 @@ module Pdxfs = structure {
     }
 
   // ============================================================================
+  // pdxfs_stat(path_ptr, statbuf_ptr) -> 0_or_errno (M2 STUB)
+  //
+  // Signature: pdxfs_stat : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): path_ptr    — VA of a NUL-terminated destination path
+  // RSI (input): statbuf_ptr — VA of a caller-owned statbuf destination
+  //                             (opaque record; PdxFS v1 statbuf layout
+  //                             not yet published)
+  // RAX (output): 0 on success, negative errno on failure.
+  //               M2 STUB returns SYS_STAT_ERR_ENOENT (-2, "target does
+  //               not exist") unconditionally so the --over-existing
+  //               undo-record gate falls through to the no-op branch.
+  //
+  // M2 STUB. The paideia-os R42 substrate at HEAD landed
+  // KIND_PDXFS_FILE + KIND_PDXFS_TXN as derived-kind + witness only;
+  // sys_pdxfs_stat is not yet exposed. Returning -2 (ENOENT) makes
+  // Undo::maybe_record_over_existing see every destination as "does
+  // not exist", so cp -r --over-existing today performs the copy but
+  // journals no undo record. When the substrate lands, this body
+  // flips to `mov rax, N_STAT; syscall; ret` and cp starts capturing
+  // real undo records for over-existing paths.
+  //
+  // The -2 return is picked deliberately: it is the "safe" default
+  // (a bogus positive return would trigger an undo-record write over
+  // a non-existent inode, corrupting the journal; a bogus success
+  // return would similarly mis-fire). ENOENT is what a real stat
+  // would return for the empty smoke-test fixture at M4.
+  //
+  // Leaf; r11 scratch; no state written.
+  // ============================================================================
+  pub let pdxfs_stat : (u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (statbuf_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-005 pdxfs_stat M2 STUB. Returns SYS_STAT_ERR_ENOENT = -2 (0xFFFFFFFFFFFFFFFE bit pattern) unconditionally so Undo::maybe_record_over_existing sees every destination as absent and the --over-existing path becomes a no-op today. The -2 sentinel is produced via xor rax,rax → sub rax, 2 — two small-immediate instructions that avoid the 64-bit movabs form and stay within paideia-as's cmp-imm ≤ 0x7FFFFFFF discipline (the sub imm8 encoding is trivially safe). When the R42 substrate lands sys_pdxfs_stat, this body flips to the standard trampoline shape (mov rax, N_STAT; syscall; ret). Leaf; r11 scratch; no state written; no test mnemonic.",
+      block: {
+        xor rax, rax;                          // rax = 0
+        sub rax, 2;                            // rax = -2 (ENOENT bit pattern)
+        ret
+      }
+    }
+
+  // ============================================================================
   // pdxfs_mkdir(path_ptr, mode) -> 0_or_errno (M2 STUB)
   //
   // Signature: pdxfs_mkdir : (u64, u64) -> u64 !{mem} @{}

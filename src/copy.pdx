@@ -235,6 +235,23 @@ module CopyFile = structure {
         lea r11, [rip + fd_src];
         mov [r11], rax;
 
+        // ---- Step 2a (M2-005): --over-existing undo capture -----------------
+        // Journal the pre-copy destination state IFF cp was invoked
+        // with --over-existing AND the destination file already exists.
+        // Undo::maybe_record_over_existing does both gates internally;
+        // its UNDO_OK return covers three cases:
+        //   (a) --over-existing was not set (no-op),
+        //   (b) destination does not exist (no-op),
+        //   (c) undo record captured successfully.
+        // Only UNDO_WRITE_ERR would abort the copy; the M2 stub never
+        // returns that (the write path is stubbed to always succeed),
+        // so no return-code gate is needed at M2. When the R42 undo-
+        // write substrate lands, add cmp rax, 0; jne to a new
+        // copy_undo_write_fail branch that jumps to copy_epilogue with
+        // rax=1 (the outer dispatch-level TXN abort unwinds).
+        mov rdi, r12;                          // dst_ptr
+        call Undo::maybe_record_over_existing;
+
         // ---- Step 3: open destination (O_WRONLY | O_CREAT = 0x41) -----------
         mov rdi, r12;                          // dst_ptr
         mov rsi, 0x41;                         // O_WRONLY | O_CREAT

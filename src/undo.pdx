@@ -1,0 +1,265 @@
+// src/undo.pdx — cp.M2-005
+// Undo module: --over-existing PdxFS v1 undo-record capture.
+//
+// Scope
+// -----
+// Plan §5.6 M2 line: `--over-existing PdxFS v1 undo record`. When
+// cp is invoked with `--over-existing`, every destination file that
+// already exists MUST have its pre-copy state journaled to a PdxFS v1
+// undo record BEFORE its bytes are overwritten. The plan-doc rationale
+// (design/tooling/plan.md I5): destructive operations are reversible;
+// `undo cp <same-args>` restores the pre-copy destination.
+//
+// M2-005 shape
+// ------------
+// The public entry point is `maybe_record_over_existing(dst_ptr)`,
+// which cp calls once per destination file (in CopyFile
+// ::copy_bytes_only, between the src-open and the dst-open). The
+// entry gates on TWO conditions:
+//   1. CpFlags::flag_over_existing_seen != 0 — the flag was on argv.
+//   2. Pdxfs::pdxfs_stat(dst_ptr) returned success — the destination
+//      file actually exists on disk. (If stat returns ENOENT, there
+//      is nothing to journal — the file will be created fresh by the
+//      subsequent dst-open with O_CREAT.)
+//
+// Only when BOTH conditions hold does the entry call into the PdxFS
+// v1 undo-journal write path. That write path is a STUB today
+// (undo_journal_write_stub, returns 0 unconditionally) because the
+// paideia-os R42 substrate at HEAD has not yet exposed the
+// sys_pdxfs_undo_write syscall — same substrate-blocker as
+// pdxfs_txn_begin / pdxfs_readdir / pdxfs_mkdir / pdxfs_stat. When the
+// substrate lands, undo_journal_write_stub's body flips to the real
+// syscall and the outer entry keeps its shape.
+//
+// The M2 STAT stub (pdxfs_stat) returns -2 (ENOENT) unconditionally,
+// so today `maybe_record_over_existing` always sees "destination
+// does not exist" and returns 0 without invoking the journal write.
+// This means the M2 --over-existing wiring is exercised end-to-end
+// at every callsite but performs no work — a shape-in-place landing
+// that will start capturing real undo records once BOTH stubs
+// (pdxfs_stat AND undo_journal_write_stub) flip.
+//
+// Statbuf storage
+// ---------------
+// A 144-byte .bss buffer holds the statbuf output. 144 = 18 * 8 is
+// larger than any x86_64 stat record shape (Linux's stat64 is 144
+// bytes; PdxFS v1's PdxStat format is TBD but expected smaller). The
+// buffer is single-invocation storage (one cp invocation is one walk;
+// each stat call reuses the buffer). Sized generously to survive
+// substrate revisions without a re-layout.
+//
+// Return codes
+// ------------
+//   UNDO_OK              = 0                — no-op OR undo captured
+//   UNDO_WRITE_ERR       = 0xFFFFFFFE       — journal write failed
+//                                              (unavailable at M2 stub;
+//                                              reserved for substrate-
+//                                              landing body-edit).
+//
+// Caller contract
+// ---------------
+// UNDO_OK is a success-continuation code. Only UNDO_WRITE_ERR would
+// force the outer copy to abort (via the dispatch-level TXN abort
+// path). The M2 stub never returns UNDO_WRITE_ERR so cp today
+// always continues after this call — matching the plan §5.6
+// "shape-in-place" landing expectation.
+//
+// Call sites (M2)
+// ---------------
+//   CopyFile::copy_bytes_only  — one call after src-open + before
+//                                dst-open. When the substrate lands
+//                                the pre-overwrite state is captured
+//                                to the undo journal at this point.
+//   Walk::walk_recursive       — per-entry, inside walk_entry_todo
+//                                (deferred with the R42 readdir
+//                                substrate landing).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Undo (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest value here: 0 for the
+//     stat-return sign check via cmp+jl; no explicit large immediates).
+//   - r11 is scratch (every lea for .bss slot addresses).
+//   - undo_reset is leaf; maybe_record_over_existing is non-leaf
+//     (calls pdxfs_stat + potentially undo_journal_write_stub).
+//     2-push prologue (rbx = dst_ptr, r12 = pushed for parity) +
+//     `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call.
+//   - Byte reads not needed body-side at M2 (statbuf parsing lands
+//     with the R42 substrate).
+
+module Undo = structure {
+
+  // -- Return codes (see file header) -----------------------------------
+  pub let UNDO_OK        : u64 = 0
+  pub let UNDO_WRITE_ERR : u64 = 0xFFFFFFFE
+
+  // -- Statbuf destination for Pdxfs::pdxfs_stat calls. 144 bytes is
+  // -- comfortably larger than any known stat record shape.
+  pub let mut undo_stat_buf : [u8; 144] = uninit @align(8)
+
+  // -- Counters for M4 test-observability. Bumped at each gate.
+  pub let mut undo_gate_calls    : u64 = uninit @align(8)  // total invocations
+  pub let mut undo_gate_noflag   : u64 = uninit @align(8)  // skipped: flag absent
+  pub let mut undo_gate_noexist  : u64 = uninit @align(8)  // skipped: stat != 0
+  pub let mut undo_records_wrote : u64 = uninit @align(8)  // real writes attempted
+
+  // ============================================================================
+  // undo_reset()
+  //
+  // Signature: undo_reset : () -> () !{mem} @{}
+  //
+  // Zero the four counter slots so a subsequent cp invocation starts
+  // from a known baseline. Leaf; r11 scratch. undo_stat_buf is
+  // overwritten by the next stat call so it does not need zeroing.
+  // ============================================================================
+  pub let undo_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-005 Undo::undo_reset. Zero the four counter slots (undo_gate_calls / undo_gate_noflag / undo_gate_noexist / undo_records_wrote) so a subsequent maybe_record_over_existing invocation starts from a known baseline. Leaf; r11 scratch.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + undo_gate_calls];    mov [r11], rax;
+        lea r11, [rip + undo_gate_noflag];   mov [r11], rax;
+        lea r11, [rip + undo_gate_noexist];  mov [r11], rax;
+        lea r11, [rip + undo_records_wrote]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // undo_journal_write_stub(dst_ptr) -> rc
+  //
+  // Signature: undo_journal_write_stub : (u64) -> u64 !{mem} @{}
+  // RDI (input): dst_ptr — VA of a NUL-terminated destination path
+  // RAX (output): UNDO_OK (M2 STUB)
+  //
+  // M2 STUB. The PdxFS v1 undo-journal write syscall
+  // (sys_pdxfs_undo_write, expected at R42 substrate expansion) is
+  // not yet exposed. This entry is the single call site for the
+  // outer maybe_record_over_existing helper; when the substrate
+  // lands only this body flips. Today: bump undo_records_wrote and
+  // return 0.
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let undo_journal_write_stub : (u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-005 Undo::undo_journal_write_stub M2 STUB. The single-choke-point for the R42 substrate landing of sys_pdxfs_undo_write. Today bumps undo_records_wrote and returns UNDO_OK; when the substrate lands, this body flips to the real syscall and every caller keeps its shape. dst_ptr is informational at M2 (the real body will pass it to the syscall as the path-to-journal). Leaf; r11 scratch.",
+      block: {
+        lea r11, [rip + undo_records_wrote];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // UNDO_OK
+        ret
+      }
+    }
+
+  // ============================================================================
+  // maybe_record_over_existing(dst_ptr) -> rc
+  //
+  // Signature: maybe_record_over_existing : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): dst_ptr — VA of a NUL-terminated destination path
+  // RAX (output): UNDO_OK | UNDO_WRITE_ERR
+  //
+  // Gate + record entry — called once per destination file from
+  // CopyFile::copy_bytes_only (M2-005 wiring) and future
+  // Walk::walk_recursive per-entry (once walk_entry_todo lands).
+  //
+  // Flow:
+  //   1. Bump undo_gate_calls.
+  //   2. Read CpFlags::flag_over_existing_seen. If 0, bump
+  //      undo_gate_noflag and return UNDO_OK (no-op — flag not set).
+  //   3. Call Pdxfs::pdxfs_stat(dst_ptr, undo_stat_buf). If return
+  //      is nonzero (destination does not exist), bump
+  //      undo_gate_noexist and return UNDO_OK (no-op — nothing to
+  //      journal). Signed compare via cmp rax, 0; jne — a real
+  //      substrate returns 0 on success, negative errno on failure;
+  //      any nonzero return means "do not journal".
+  //   4. Otherwise call undo_journal_write_stub(dst_ptr) and return
+  //      its result verbatim (which is UNDO_OK at M2 stub).
+  //
+  // Register plan (non-leaf; 2-push + pad):
+  //   rbx = dst_ptr (survives the stat call so the write_stub sees it)
+  //   r12 = unused (pushed for alignment parity)
+  //   rax = call return / temp
+  //   rdi, rsi = nested-call arg carriers
+  //   r11 = lea scratch
+  //
+  // rsp arithmetic:
+  //   entry:               rsp % 16 == 8
+  //   after push rbx:      rsp % 16 == 0
+  //   after push r12:      rsp % 16 == 8
+  //   after sub rsp, 8:    rsp % 16 == 0
+  //   epilogue reverses.
+  // ============================================================================
+  pub let maybe_record_over_existing : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M2-005 Undo::maybe_record_over_existing. Gate + record for the --over-existing PdxFS v1 undo-record write path. Bumps undo_gate_calls, then two short-circuits: (a) CpFlags::flag_over_existing_seen == 0 → bump undo_gate_noflag, return UNDO_OK; (b) pdxfs_stat(dst) != 0 → bump undo_gate_noexist, return UNDO_OK (destination absent, no undo to journal). Only when the flag is set AND stat succeeds does the entry call into undo_journal_write_stub — the single R42 substrate-blocking sink. 2-push prologue (rbx=dst_ptr survives stat call, r12=parity) + `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call (pdxfs_stat, undo_journal_write_stub). paideia-as compliance: r11 scratch for every .bss lea; cmp reg,imm uses immediates ≤ 0x7FFFFFFF (largest is 0 for the sign-check via cmp+jne); no test mnemonic; no byte reads; stat return sign detection uses cmp rax,0; jne (any nonzero → skip). sysreg effect adopted because pdxfs_stat's syscall clobbers rcx/r11.",
+      block: {
+        // ---- Prologue -------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = dst_ptr
+
+        // ---- Step 1: bump undo_gate_calls -----------------------------------
+        lea r11, [rip + undo_gate_calls];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- Step 2: gate on flag_over_existing_seen ------------------------
+        lea r11, [rip + CpFlags::flag_over_existing_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne undo_stat_check;
+
+        // Flag not set — bump noflag counter and return UNDO_OK.
+        lea r11, [rip + undo_gate_noflag];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // UNDO_OK
+        jmp undo_epilogue;
+
+        // ---- Step 3: stat check ---------------------------------------------
+      undo_stat_check:
+        mov rdi, rbx;                          // dst_ptr
+        lea rsi, [rip + undo_stat_buf];        // statbuf
+        call Pdxfs::pdxfs_stat;
+        cmp rax, 0;
+        je undo_do_write;                      // 0 → success → do write
+
+        // Any nonzero (including negative-errno) → destination absent
+        // or stat-failed — either way, no undo to journal.
+        lea r11, [rip + undo_gate_noexist];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // UNDO_OK
+        jmp undo_epilogue;
+
+        // ---- Step 4: journal-write ------------------------------------------
+      undo_do_write:
+        mov rdi, rbx;                          // dst_ptr
+        call Undo::undo_journal_write_stub;
+        // rax carries write_stub's return; propagate untouched.
+        jmp undo_epilogue;
+
+        // ---- Epilogue -------------------------------------------------------
+      undo_epilogue:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

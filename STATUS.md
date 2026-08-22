@@ -1,7 +1,7 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — in progress
+**Current milestone:** M2 (core implementation) — complete
 
 ## Milestone map
 
@@ -15,14 +15,18 @@
   sys_close. `KIND_PDXFS_TXN` begin/commit are M1 stubs (return 0)
   because the kernel does not yet expose txn syscalls; the M2 patch
   swaps only the two stub bodies.
-- **M2 — core implementation (in progress).** Recursive `-r` walk
-  via `Walk::walk_recursive` gated behind libpdx-argv typed-flag
-  registration (issue #4 — LANDED). Cap-tail preservation stub via
+- **M2 — core implementation (complete).** Recursive `-r` walk via
+  `Walk::walk_recursive` gated behind libpdx-argv typed-flag
+  registration (issue #4). Cap-tail preservation via
   `SignedInode::preserve_at_destination` (issue #5). Graceful
-  signed-inode degrade with `--verbose` diagnostic (issue #6).
-  Single-TXN atomicity hoisted to dispatch level with `txn_abort` on
+  signed-inode degrade with `--verbose` diagnostic (issue #6). Single-
+  TXN atomicity hoisted to dispatch level with `pdxfs_txn_abort` on
   partial failure (issue #7). `--over-existing` PdxFS v1 undo record
-  via `Undo::record_over_existing` stub (issue #8).
+  via `Undo::maybe_record_over_existing` (issue #8). Multiple
+  substrate-blocked call sites (readdir/mkdir/stat/undo-write) ship
+  as stubs matching M1's txn-begin/commit stub discipline — R42
+  substrate expansion is a body-edit landing site with no
+  restructure required in cp.
 - **M3 — semantic-pipe / audit integration (not started).**
   CopyProgressRecord[] per file via libpdx-semantic-pipe; CopyRecord
   pre-output journal via libpdx-audit; libpdx-elevate retry when

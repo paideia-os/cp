@@ -41,6 +41,7 @@ sources:
   - src/flags.pdx                 # M2-001 CpFlags: typed-flag registration + mirror
   - src/walk.pdx                  # M2-001 Walk: recursive -r directory walk
   - src/signed_inode.pdx          # M2-002 SignedInode: cap-tail preservation stub
+  - src/undo.pdx                  # M2-005 Undo: --over-existing PdxFS v1 undo record stub
 
 # --- Library dependencies -----------------------------------------------
 # M2 pulls libpdx-argv ≥ 0.2 (FlagSpec + StdVocab + find_flag_by_id
