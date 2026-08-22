@@ -199,14 +199,14 @@ module SignedInode = structure {
         // Emit SI_DEGRADE_MSG on stderr iff CpFlags::flag_verbose_seen
         // is set. Silent-by-default: cp does not warn on cap-tail
         // degrade unless the invoker asked for verbose output.
-        lea r11, [rip + CpFlags::flag_verbose_seen];
+        lea r11, [rip + flag_verbose_seen];
         mov rax, [r11];
         cmp rax, 0;
         je si_pad_return;
 
         lea rdi, [rip + SI_DEGRADE_MSG];
         mov rsi, 46;                           // SI_DEGRADE_MSG_LEN
-        call Print::print_err;
+        call print_err;
 
       si_pad_return:
         // Return SI_DEGRADED_KEY_LOCKED.

@@ -229,12 +229,12 @@ module CopyFile = structure {
         mov r12, rsi;                          // r12 = dst_ptr
 
         // ---- Step 1: reset state --------------------------------------------
-        call CopyFile::copy_reset;
+        call copy_reset;
 
         // ---- Step 2: open source (O_RDONLY = 0) -----------------------------
         mov rdi, rbx;                          // src_ptr
         mov rsi, 0;                            // O_RDONLY
-        call Pdxfs::pdxfs_open;
+        call pdxfs_open;
         cmp rax, 0;
         jl copy_open_src_fail;
 
@@ -257,12 +257,12 @@ module CopyFile = structure {
         // copy_undo_write_fail branch that jumps to copy_epilogue with
         // rax=1 (the outer dispatch-level TXN abort unwinds).
         mov rdi, r12;                          // dst_ptr
-        call Undo::maybe_record_over_existing;
+        call maybe_record_over_existing;
 
         // ---- Step 3: open destination (O_WRONLY | O_CREAT = 0x41) -----------
         mov rdi, r12;                          // dst_ptr
         mov rsi, 0x41;                         // O_WRONLY | O_CREAT
-        call Pdxfs::pdxfs_open;
+        call pdxfs_open;
         cmp rax, 0;
         jge copy_open_dst_ok;                  // success on first try
 
@@ -276,14 +276,14 @@ module CopyFile = structure {
         // essentially a shape-in-place wire at M3; the M4 body-edit
         // starts seeing CP_ELEVATE_OK once the broker daemon lands.
         mov rdi, r12;                          // dst_ptr (informational)
-        call CpElevate::cp_elevate_try_dst_parent;
+        call cp_elevate_try_dst_parent;
         cmp rax, 0;                            // CP_ELEVATE_OK?
         jne copy_open_dst_fail;                // refused → normal fail
 
         // Elevate approved — retry the open once.
         mov rdi, r12;                          // dst_ptr
         mov rsi, 0x41;                         // O_WRONLY | O_CREAT
-        call Pdxfs::pdxfs_open;
+        call pdxfs_open;
         cmp rax, 0;
         jl copy_open_dst_fail;                 // still failing → give up
 
@@ -298,7 +298,7 @@ module CopyFile = structure {
         mov rdi, r13;                          // fd_src
         lea rsi, [rip + copy_buf];             // buf
         mov rdx, 4096;                         // COPY_BUF_LEN
-        call Pdxfs::pdxfs_read;
+        call pdxfs_read;
 
         cmp rax, 0;
         jl copy_read_fail;                     // negative errno → error
@@ -310,7 +310,7 @@ module CopyFile = structure {
         mov rdi, r14;                          // fd_dst
         lea rsi, [rip + copy_buf];             // buf
         mov rdx, r15;                          // len = n
-        call Pdxfs::pdxfs_write;
+        call pdxfs_write;
 
         cmp rax, 0;
         jl copy_write_fail;                    // negative errno → error
@@ -334,10 +334,10 @@ module CopyFile = structure {
         // do anything about; the fd is released at task teardown
         // regardless). The outer TXN commit happens in dispatch.
         mov rdi, r14;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         // ---- Step 7 (M2-002): preserve destination cap-tail -----------------
         // Attempt to re-sign the destination inode under the invoker's
@@ -349,7 +349,7 @@ module CopyFile = structure {
         // failure mode). Consequently no return-code gate is needed
         // here at M2 — the call is fire-and-continue.
         mov rdi, r12;                          // dst_ptr
-        call SignedInode::preserve_at_destination;
+        call preserve_at_destination;
 
         // ---- Step 8 (M3-001): emit CopyProgressRecord on stdout -------------
         // rbx = src_path, r12 = dst_path (both preserved across the
@@ -366,7 +366,7 @@ module CopyFile = structure {
         lea r11, [rip + bytes_copied];
         mov rdx, [r11];                        // bytes_copied
         mov rcx, rdx;                          // bytes_total = bytes_copied
-        call CpPipe::cp_pipe_emit_progress;
+        call cp_pipe_emit_progress;
 
         xor rax, rax;                          // EXIT_OK (0)
         jmp copy_epilogue;
@@ -379,54 +379,54 @@ module CopyFile = structure {
       copy_open_src_fail:
         lea rdi, [rip + OPEN_SRC_FAIL_MSG];
         mov rsi, 28;                           // OPEN_SRC_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;                            // EXIT_OP_FAIL
         jmp copy_epilogue;
 
       copy_open_dst_fail:
         // fd_src is open; close it before we return.
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         lea rdi, [rip + OPEN_DST_FAIL_MSG];
         mov rsi, 33;                           // OPEN_DST_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp copy_epilogue;
 
       copy_read_fail:
         mov rdi, r14;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         lea rdi, [rip + READ_FAIL_MSG];
         mov rsi, 28;                           // READ_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp copy_epilogue;
 
       copy_write_fail:
         mov rdi, r14;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         lea rdi, [rip + WRITE_FAIL_MSG];
         mov rsi, 32;                           // WRITE_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp copy_epilogue;
 
       copy_short_write:
         mov rdi, r14;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         lea rdi, [rip + SHORT_WRITE_MSG];
         mov rsi, 47;                           // SHORT_WRITE_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp copy_epilogue;
 
@@ -462,7 +462,7 @@ module CopyFile = structure {
       block: {
         push rbx;                              // align rsp for nested call
 
-        call CopyFile::copy_bytes_only;
+        call copy_bytes_only;
         // rax carries copy_bytes_only's exit code (0 or 1).
 
         pop rbx;

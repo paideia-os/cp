@@ -196,25 +196,25 @@ module Dispatch = structure {
         // (audit_id or 0) is stored inside CpAudit's .bss slot; we
         // do not gate on it at M3 (broker unavailable is a shape-in-
         // place condition today; M4 hardens with audit_can_emit_output).
-        call CpAudit::cp_audit_begin_wrap;
+        call cp_audit_begin_wrap;
 
         // ---- Step 1: mirror the four cp flag IDs ---------------------------
-        call CpFlags::flags_reset;
-        call CpFlags::populate;
+        call flags_reset;
+        call populate;
 
         // ---- Step 2: pos_count == 2 check (pre-TXN) ------------------------
-        lea r11, [rip + ParsedArgs::pos_count];
+        lea r11, [rip + pos_count];
         mov rax, [r11];
         cmp rax, 2;
         jne dispatch_usage_error;
 
         // ---- Step 3: open outer TXN ----------------------------------------
-        call Pdxfs::pdxfs_txn_begin;
+        call pdxfs_txn_begin;
         cmp rax, 0;
         jl dispatch_txn_begin_fail;
 
         // ---- Step 4: recursive-vs-single route (both under the TXN) --------
-        lea r11, [rip + CpFlags::flag_recursive_seen];
+        lea r11, [rip + flag_recursive_seen];
         mov rax, [r11];
         cmp rax, 0;
         je dispatch_single_file;
@@ -224,10 +224,10 @@ module Dispatch = structure {
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
 
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
         mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
-        call Walk::walk_recursive;
+        call walk_recursive;
         mov rbx, rax;                          // rbx = body exit code
         jmp dispatch_body_return;
 
@@ -236,10 +236,10 @@ module Dispatch = structure {
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
 
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
         mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
-        call CopyFile::copy_bytes_only;
+        call copy_bytes_only;
         mov rbx, rax;                          // rbx = body exit code
 
         // ---- Step 5: commit or abort based on body exit --------------------
@@ -248,7 +248,7 @@ module Dispatch = structure {
         jne dispatch_body_fail_abort;
 
         // Body succeeded — commit the TXN.
-        call Pdxfs::pdxfs_txn_commit;
+        call pdxfs_txn_commit;
         cmp rax, 0;
         jl dispatch_txn_commit_fail;
 
@@ -259,23 +259,23 @@ module Dispatch = structure {
       dispatch_body_fail_abort:
         // Body failed. Abort the TXN (silent; return ignored) and
         // propagate the body's exit code as our exit code.
-        call Pdxfs::pdxfs_txn_abort;
+        call pdxfs_txn_abort;
         mov rax, rbx;                          // preserve body exit
         jmp dispatch_epilogue;
 
       dispatch_txn_begin_fail:
         lea rdi, [rip + TXN_BEGIN_FAIL_MSG];
         mov rsi, 29;                           // TXN_BEGIN_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;                            // EXIT_OP_FAIL
         jmp dispatch_epilogue;
 
       dispatch_txn_commit_fail:
         // Commit failed. Best-effort abort (silent) and return 1.
-        call Pdxfs::pdxfs_txn_abort;
+        call pdxfs_txn_abort;
         lea rdi, [rip + TXN_COMMIT_FAIL_MSG];
         mov rsi, 30;                           // TXN_COMMIT_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;                            // EXIT_OP_FAIL
         jmp dispatch_epilogue;
 
@@ -286,7 +286,7 @@ module Dispatch = structure {
 
         lea rdi, [rip + USAGE_MSG];
         mov rsi, 60;                           // USAGE_MSG_LEN
-        call Print::print_err;
+        call print_err;
 
         mov rax, 2;                            // EXIT_USAGE
         jmp dispatch_epilogue;
@@ -303,7 +303,7 @@ module Dispatch = structure {
         // audit-broker-unavailable at M3 does not change the exit code.
         mov rbx, rax;                          // save exit code
         mov rdi, rbx;                          // audit_commit_wrap arg = exit_code
-        call CpAudit::cp_audit_commit_wrap;
+        call cp_audit_commit_wrap;
         mov rax, rbx;                          // restore exit code
 
         add rsp, 8;

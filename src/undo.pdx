@@ -215,7 +215,7 @@ module Undo = structure {
         mov [r11], rax;
 
         // ---- Step 2: gate on flag_over_existing_seen ------------------------
-        lea r11, [rip + CpFlags::flag_over_existing_seen];
+        lea r11, [rip + flag_over_existing_seen];
         mov rax, [r11];
         cmp rax, 0;
         jne undo_stat_check;
@@ -233,7 +233,7 @@ module Undo = structure {
       undo_stat_check:
         mov rdi, rbx;                          // dst_ptr
         lea rsi, [rip + undo_stat_buf];        // statbuf
-        call Pdxfs::pdxfs_stat;
+        call pdxfs_stat;
         cmp rax, 0;
         je undo_do_write;                      // 0 → success → do write
 
@@ -250,7 +250,7 @@ module Undo = structure {
         // ---- Step 4: journal-write ------------------------------------------
       undo_do_write:
         mov rdi, rbx;                          // dst_ptr
-        call Undo::undo_journal_write_stub;
+        call undo_journal_write_stub;
         // rax carries write_stub's return; propagate untouched.
         jmp undo_epilogue;
 

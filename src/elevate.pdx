@@ -214,7 +214,7 @@ module CpElevate = structure {
         mov rsi, r11;                          // dur
         lea rdx, [rip + cp_elevate_req_buf];   // req_buf
         lea rcx, [rip + cp_elevate_reply_buf]; // reply_buf
-        call ElevateClient::elevate_client_request;
+        call elevate_client_request;
 
         cmp rax, 0;                            // ELVC_OK ?
         jne cp_elevate_refused;

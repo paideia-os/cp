@@ -121,24 +121,24 @@ module CpMain = structure {
         mov r12, rdi;                          // r12 = argc
 
         // Step 1: reset FlagSpec and register the standard + cp flags.
-        call FlagSpec::reset;
-        call StdVocab::register_all;
-        call CpFlags::register_cp_flags;
+        call reset;
+        call register_all;
+        call register_cp_flags;
 
         // Step 2: reset libpdx-argv parse state.
-        call ParsedArgs::reset;
+        call reset;
 
         // Step 2a (M3): reset the M3 module counters. All three are
         // leaves; they only zero counter .bss slots and do not touch
         // any argv-derived state so ordering vs parse is irrelevant.
-        call CpPipe::cp_pipe_reset;
-        call CpAudit::cp_audit_reset;
-        call CpElevate::cp_elevate_reset;
+        call cp_pipe_reset;
+        call cp_audit_reset;
+        call cp_elevate_reset;
 
         // Step 3: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
         mov rsi, r12;
-        call Parser::parse_argv;
+        call parse_argv;
 
         // Step 4: check parse error. rax == 0 (ERR_OK) → continue.
         cmp rax, 0;
@@ -147,7 +147,7 @@ module CpMain = structure {
         // Parse failed: print diagnostic, return EXIT_USAGE.
         lea rdi, [rip + PARSE_FAIL_MSG];
         mov rsi, 39;                           // PARSE_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
 
         mov rax, 2;                            // EXIT_USAGE
         jmp cp_main_epilogue;
@@ -160,13 +160,13 @@ module CpMain = structure {
         // path (cp_pipe_emit_progress) reduces to a counter bump via
         // SP_SEND_ERR_NOT_BOUND translation, so cp continues to copy
         // bytes even without a bound stdout schema.
-        call CpPipe::cp_pipe_bind_stdout;
+        call cp_pipe_bind_stdout;
 
         // Step 5: dispatch. dispatch_copy wraps the whole invocation in
         // the M3-002 audit begin/commit pair, opens the M2-004 outer
         // TXN, and routes to Walk::walk_recursive (-r) or
         // CopyFile::copy_single_file.
-        call Dispatch::dispatch_copy;
+        call dispatch_copy;
         // rax now carries dispatch's exit code; fall through.
 
       cp_main_epilogue:

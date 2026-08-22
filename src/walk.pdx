@@ -183,34 +183,34 @@ module Walk = structure {
         mov r12, rsi;                          // r12 = dst_ptr
 
         // ---- Step 1: reset state --------------------------------------------
-        call Walk::walk_reset;
+        call walk_reset;
 
         // ---- Step 2: verbose diagnostic (optional) --------------------------
         // Skip when flag_verbose_seen == 0. Reading the mirror slot
         // rather than re-querying ParsedArgs keeps the fast-path free
         // of the linear scan over flag_ids.
-        lea r11, [rip + CpFlags::flag_verbose_seen];
+        lea r11, [rip + flag_verbose_seen];
         mov rax, [r11];
         cmp rax, 0;
         je walk_verbose_done;
 
         lea rdi, [rip + VERBOSE_ENTER_MSG];
         mov rsi, 22;                           // VERBOSE_ENTER_MSG_LEN
-        call Print::print_err;
+        call print_err;
 
       walk_verbose_done:
 
         // ---- Step 3: mkdir destination (0o755 = 0x1ED) ----------------------
         mov rdi, r12;                          // dst_ptr
         mov rsi, 0x1ED;                        // 0o755 permission bits
-        call Pdxfs::pdxfs_mkdir;
+        call pdxfs_mkdir;
         cmp rax, 0;
         jl walk_mkdir_fail;
 
         // ---- Step 4: open source directory (O_RDONLY = 0) -------------------
         mov rdi, rbx;                          // src_ptr
         mov rsi, 0;                            // O_RDONLY
-        call Pdxfs::pdxfs_open;
+        call pdxfs_open;
         cmp rax, 0;
         jl walk_open_srcdir_fail;
 
@@ -223,7 +223,7 @@ module Walk = structure {
         mov rdi, r13;                          // fd_src_dir
         lea rsi, [rip + walk_entry_buf];       // buf
         mov rdx, 4096;                         // WALK_ENTRY_BUF_LEN
-        call Pdxfs::pdxfs_readdir;
+        call pdxfs_readdir;
 
         cmp rax, 0;
         jl walk_readdir_fail;                  // negative errno → error
@@ -266,7 +266,7 @@ module Walk = structure {
         // ---- Success epilogue: close fd, return 0 ---------------------------
       walk_readdir_eof:
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         xor rax, rax;                          // EXIT_OK (0)
         jmp walk_epilogue;
@@ -278,24 +278,24 @@ module Walk = structure {
       walk_mkdir_fail:
         lea rdi, [rip + MKDIR_FAIL_MSG];
         mov rsi, 31;                           // MKDIR_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;                            // EXIT_OP_FAIL
         jmp walk_epilogue;
 
       walk_open_srcdir_fail:
         lea rdi, [rip + OPEN_SRCDIR_FAIL_MSG];
         mov rsi, 33;                           // OPEN_SRCDIR_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp walk_epilogue;
 
       walk_readdir_fail:
         mov rdi, r13;
-        call Pdxfs::pdxfs_close;
+        call pdxfs_close;
 
         lea rdi, [rip + READDIR_FAIL_MSG];
         mov rsi, 30;                           // READDIR_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 1;
         jmp walk_epilogue;
 

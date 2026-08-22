@@ -170,7 +170,7 @@ module CpAudit = structure {
 
         lea rdi, [rip + CP_OP_NAME_STR];       // op_name
         lea rsi, [rip + CP_OP_ARGS_STR];       // op_args
-        call AuditClient::audit_begin;
+        call audit_begin;
         // rax = audit_id (>0) or 0 on failure — either value is a
         // legal store target for cp_audit_id (the commit wrapper's
         // id-gate handles 0 as no-op).
@@ -229,7 +229,7 @@ module CpAudit = structure {
         // rax = audit_id; move to rdi. rsi = exit_code from rbx.
         mov rdi, rax;
         mov rsi, rbx;
-        call AuditClient::audit_commit;
+        call audit_commit;
         // rax = audit_commit's rc; propagate verbatim.
         jmp cp_audit_commit_epilogue;
 

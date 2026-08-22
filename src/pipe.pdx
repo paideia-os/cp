@@ -179,7 +179,7 @@ module CpPipe = structure {
 
         mov rdi, 1;                            // FD_STDOUT
         lea rsi, [rip + COPY_PROGRESS_SCHEMA_HASH];
-        call Binding::libpdx_semantic_pipe_bind;
+        call libpdx_semantic_pipe_bind;
         cmp rax, 0;
         jne cp_pipe_bind_err;
 
@@ -273,7 +273,7 @@ module CpPipe = structure {
         mov rdi, 1;                            // FD_STDOUT
         lea rsi, [rip + cp_progress_rec];      // rec_ptr
         mov rdx, 40;                           // COPY_PROGRESS_REC_LEN
-        call Send::send_record;
+        call send_record;
         cmp rax, 0;
         jne cp_pipe_emit_err;
 

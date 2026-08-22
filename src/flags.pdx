@@ -144,13 +144,13 @@ module CpFlags = structure {
         push rbx;                                // align rsp%16 to 0
 
         lea rdi, [rip + CP_NAME_RECURSIVE];     mov rsi, 0;    mov rdx, 100;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + CP_NAME_VERBOSE_SHORT]; mov rsi, 0;    mov rdx, 101;
-        call FlagSpec::register;
+        call register;
 
         lea rdi, [rip + CP_NAME_OVER_EXISTING]; mov rsi, 0;    mov rdx, 102;
-        call FlagSpec::register;
+        call register;
 
         pop rbx;
         ret
@@ -210,7 +210,7 @@ module CpFlags = structure {
 
         // ---- CP_ID_RECURSIVE (id 100) --------------------------------------
         mov rdi, 100;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         mov rbx, rax;                          // rbx = k
         cmp rbx, 32;                           // MAX_FLAGS sentinel
         jge cpf_pop_recursive_absent;
@@ -231,7 +231,7 @@ module CpFlags = structure {
         // ---- CP_ID_VERBOSE short (id 101) ----------------------------------
       cpf_pop_verbose_short:
         mov rdi, 101;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         mov rbx, rax;
         cmp rbx, 32;
         jge cpf_pop_verbose_short_absent;
@@ -253,7 +253,7 @@ module CpFlags = structure {
         // ---- STD_ID_VERBOSE long (id 6) — folds into flag_verbose ----------
       cpf_pop_verbose_long:
         mov rdi, 6;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         mov rbx, rax;
         cmp rbx, 32;
         jge cpf_pop_dry_run;
@@ -278,7 +278,7 @@ module CpFlags = structure {
         // ---- STD_ID_DRY_RUN (id 3) → flag_dry_run --------------------------
       cpf_pop_dry_run:
         mov rdi, 3;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         mov rbx, rax;
         cmp rbx, 32;
         jge cpf_pop_dry_run_absent;
@@ -298,7 +298,7 @@ module CpFlags = structure {
         // ---- CP_ID_OVER_EXISTING (id 102) → flag_over_existing -------------
       cpf_pop_over_existing:
         mov rdi, 102;
-        call ParsedArgs::find_flag_by_id;
+        call find_flag_by_id;
         mov rbx, rax;
         cmp rbx, 32;
         jge cpf_pop_over_existing_absent;
