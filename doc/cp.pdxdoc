@@ -1,0 +1,272 @@
+# cp.pdxdoc — long-form doc for `doc cp`
+#
+# Wave: R50  Milestone: M5 (1.0 signed release)
+# Doc format: `design/tooling/plan.md` I7 §2 in the paideia-os repo.
+# Rendered by the `doc` tool (Category F, P0) — parses this file per
+# `doc.M1-002 .pdxdoc file-format parser` and emits a paginated,
+# cross-referenced text render to KIND_TTY.
+#
+# The .pdxdoc format is line-oriented: `@section`, `@subsection`,
+# `@para`, `@example`, `@xref`, and `@posix-diff` directives are
+# recognised by the doc parser at doc.M1-002; every other line is
+# body text within the current section. Ordering is significant —
+# the parser walks the file top-to-bottom to build the render tree.
+
+@doc-format-version 1
+@tool cp
+@version 1.0.0
+@one-liner Copy a file or a directory tree in one atomic PdxFS transaction.
+
+@section 1. Name
+
+@para
+cp — copy a file or a directory tree, atomically, with per-file
+capability re-signing and a PdxFS undo record on overwrite.
+
+@section 2. Synopsis
+
+@example
+cp [--flag ...] [-flag ...] <src> <dst>
+cp -r <src-dir> <dst-dir>
+
+@para
+Two positional arguments — source path and destination path — are
+required. When `-r` is present, the source is a directory tree and
+the destination is the parent directory of the target tree. When
+`-r` is absent the source must be a regular file.
+
+@section 3. Description
+
+@para
+cp copies bytes from `<src>` to `<dst>` under a single PdxFS
+transaction: every write is either fully visible at the destination
+or fully rolled back. Partial-copy states are not visible to any
+concurrent reader; a mid-copy crash or a mid-copy signal that ends
+the process leaves the destination byte-identical to its pre-copy
+state.
+
+@para
+Every cp invocation also (a) journals a `CopyRecord` to the audit
+log before writing any bytes (D3 audit-first — the record is
+present even on failure), (b) emits `CopyProgressRecord[]` on its
+stdout fd bound to schema `CopyProgressRecord@0.1` (D2 semantic
+pipes — downstream `query`, `sort`, `pipeviz` consume the typed
+records without column-slicing text), and (c) attempts to re-sign
+the destination inode's cap tail under the invoker's `user_sk`
+so ownership provenance survives the copy (`design/user/model.md`
+§10.2 signed-inode field). When the invoker's key is locked or
+the copy crosses user boundaries, the re-sign gracefully degrades;
+the file bytes still land and `--verbose` emits a one-line
+diagnostic naming the degrade cause.
+
+@para
+When `--over-existing` is present and the destination already
+exists, cp writes a PdxFS v1 undo record before overwriting so
+`undo cp <same-args>` restores the pre-copy destination bytes.
+Without `--over-existing`, an existing destination is treated as
+an error (exit 1) — this differs from POSIX cp which silently
+overwrites by default.
+
+@section 4. Options
+
+@subsection 4.1 cp-specific flags
+
+@example
+-r                    Recursively copy a directory tree.
+-v                    Emit CopyProgressRecord[] per file on stdout.
+--dry-run             Preview the copy without writing to dst.
+--over-existing       Write undo record before overwriting.
+
+@subsection 4.2 Standard flag vocabulary (I3)
+
+@example
+--help                Render this document via `doc cp`.
+--version             Print `cp 1.0.0 (build <hash>) sig <fingerprint>`.
+--json                Emit CopyProgressRecord[] as JSON.
+--schema              Print CopyProgressRecord schema and exit.
+--verbose             Additional diagnostics on stderr (audit ids).
+--quiet               Suppress non-error diagnostics.
+--no-cap:<name>       Drop the named cap before exec (per D5).
+--pdx-schema          Set emit_schema=1 in ParsedArgs.
+
+@section 5. Exit codes
+
+@example
+0    success.
+1    operation failed (open/read/write error, short write).
+2    usage error (parse fail, wrong positional count).
+3    recognised shape, body not yet implemented (see M-diff).
+4    cap denied (elevate refused, cross-user preservation locked).
+
+@para
+Code 3 is a bootstrap-era reservation — it names an argv shape the
+parser accepts but the milestone body does not yet implement. At
+1.0, `-r` at pos_count > 2 is the last surviving exit-3 site;
+every other flag body is wired.
+
+@section 6. Capabilities required
+
+@para
+Every cp invocation receives these caps from the loader's InitCap
+sidecar per `caps.decl`. The loader narrows the two file caps'
+scope to the argument path prefixes at exec — cp cannot read or
+write outside the source and destination-parent subtrees named on
+argv.
+
+@example
+KIND_USER              (self)
+KIND_IPC_ENDPOINT      (invoke)
+KIND_PDXFS_FILE        (read,  <src>)
+KIND_PDXFS_FILE        (write, <dst-parent>)
+KIND_PDXFS_TXN         (invoke)
+
+@para
+Cross-subtree destinations trigger a KIND_ELEVATE_CHANNEL request
+at M3-003. The request specifies the widened `KIND_PDXFS_FILE
+(write, <dst-parent>)` cap; the approver hop returns either a
+widened cap (auto-approve or human-approve OK) or a refuse. On
+refuse, cp exits 4 with a stderr diagnostic naming the missing
+cap. cp never opens a broker hop the substrate does not yet expose —
+if the elevate broker is unreachable, cp exits 4 with a distinct
+diagnostic.
+
+@section 7. Output schemas
+
+@para
+cp binds fd 1 (stdout) to `CopyProgressRecord@0.1` at
+`main.pdx::cp_main` before dispatching. Every successful per-file
+copy emits one record naming the source path, destination path,
+byte count copied, elapsed wall-clock, and the cap-tail preserve
+outcome (OK / DEGRADED_KEY_LOCKED / DEGRADED_CROSS_USER).
+Downstream:
+
+@example
+$ cp -r /src/tree /dst/tree | query 'select path where bytes > 1M'
+$ cp -r /src/tree /dst/tree | pipeviz --bar bytes
+
+@para
+The record schema hash is stable across every 1.0.x release. A
+schema-incompatible bump is a 2.0 concern; the M3-001 `--schema`
+flag prints the current schema definition on stdout for offline
+inspection.
+
+@section 8. Audit + undo
+
+@para
+Every cp invocation writes an audit record to `/system/audit/user-
+events/` before it writes any bytes. On success the record is
+sealed with the outcome (bytes copied, elapsed) at commit time. On
+failure the seal contains the failure code and the partial state
+was rolled back at the TXN boundary — the audit log names the
+attempt even when nothing landed.
+
+@para
+`--over-existing` additionally writes a PdxFS v1 undo record to the
+destination's parent subtree. `undo cp <same-args>` walks the undo
+graph and restores the pre-copy destination bytes. Multi-file
+recursive copies write one undo record per over-written destination;
+`undo` replays them in reverse order.
+
+@section 9. POSIX differences
+
+@posix-diff
+POSIX cp overwrites existing destinations by default; paideia-os
+cp refuses (exit 1) unless `--over-existing` is present.
+
+@posix-diff
+POSIX cp emits no output on success; paideia-os cp emits
+CopyProgressRecord[] on stdout (empty when the source is empty).
+`--quiet` suppresses the records for POSIX-shell scripts that
+expected silence.
+
+@posix-diff
+POSIX cp does not journal to an audit log; paideia-os cp writes
+a CopyRecord before every operation (audit-first per D3).
+
+@posix-diff
+POSIX cp treats every copy as opaque bytes; paideia-os cp attempts
+cap-tail re-signing at every destination so ownership provenance
+travels with the file.
+
+@posix-diff
+POSIX cp exit codes are 0 / >0; paideia-os cp distinguishes usage
+(2), not-yet-implemented (3), and cap-denied (4) so scripts can
+branch on the cause.
+
+@section 10. Examples
+
+@example
+# Single file, silent success.
+$ cp /home/alice/notes.md /tmp/notes.md
+$ echo $?
+0
+
+@example
+# Recursive tree copy with progress records piped to a filter.
+$ cp -r /src/photos /backup/photos | query 'where bytes > 4M'
+
+@example
+# Overwrite an existing destination with a rollback point.
+$ cp --over-existing /new/config /etc/paideia/config
+$ undo cp --over-existing /new/config /etc/paideia/config
+$ diff /etc/paideia/config /old/config    # matches; undo restored it.
+
+@example
+# Preview without touching the destination.
+$ cp --dry-run -r /src /dst
+cp: would copy 214 files (127.4 MiB) into /dst
+
+@example
+# Cross-subtree destination — elevate hop.
+$ cp report.pdf /srv/shared/2026/
+cp: requesting KIND_PDXFS_FILE(write, /srv/shared/2026/) via elevate...
+cp: approved (auto-policy: /srv/shared/**/ writable by user alice).
+
+@example
+# Cross-user copy — signed-inode degrades, bytes still land.
+$ cp -v /home/alice/report.pdf /home/bob/inbox/report.pdf
+cp: cap-tail preserve DEGRADED_CROSS_USER (destination unsigned).
+
+@section 11. Files
+
+@example
+caps.decl              Capability manifest (baseline cap set).
+manifest.pdxproj       paideia-as build manifest.
+manifest.pdxsig        Dual-signed release manifest (author + root).
+CHANGELOG.md           Per-version change log.
+doc/cp.pdxdoc          This document.
+src/*.pdx              Source (12 modules, one responsibility each).
+tests/*.md             Test-spec matrices (18 rows across 3 files).
+
+@section 12. Cross-references
+
+@xref pkg              Package manager — installs and verifies cp.
+@xref mv               Move / rename — shares signed-inode logic.
+@xref rm               Remove — shares undo-record discipline.
+@xref undo             Undo replay — walks the PdxFS undo graph.
+@xref doc              This tool renders this document.
+@xref query            Consumes CopyProgressRecord[] on stdin.
+@xref libpdx-audit     Provides audit_begin / audit_commit.
+@xref libpdx-elevate   Provides the cross-subtree cap-widening hop.
+@xref libpdx-cap       Provides signed-inode preservation helpers.
+
+@section 13. See also
+
+@para
+`design/user/model.md` §10.2 (signed-inode field), `design/tooling/
+plan.md` D3 (audit-first) + D5 (undo-first-order) + I5 (destructive
+ops reversible), `design/tooling/r49-r50-plan.md` §5.6 (per-
+milestone plan) — all in the paideia-os repo.
+
+@section 14. Bugs
+
+@para
+File issues at `https://github.com/paideia-os/cp/issues`. Include
+the invocation, the `cp --version` output (build hash + signature
+fingerprint), and the audit record id (rendered by cp `--verbose`
+on stderr) so the audit log is queryable during triage.
+
+@section 15. Author
+
+@para
+snunez. MIT-licensed per `LICENSE` at repo root.

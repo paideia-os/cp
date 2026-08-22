@@ -1,0 +1,114 @@
+# cp — manifest.pdxsig
+#
+# Wave: R50  Milestone: M5 (1.0 signed release)
+# Doc:   design/tooling/r49-r50-plan.md §5.6 + §9.3 in the paideia-os repo.
+#
+# Dual-signature block for `cp` v1.0.0. Consumed by `pkg install cp` on
+# the target machine — after the pkg fetcher pulls the release tarball
+# from a `pkgs.paideia-os` mirror, it invokes `ml_dsa_65_verify` twice
+# against this file (once with `author_pk`, once with `paideia_root_pk`).
+# Both signatures must verify for the install to proceed; either failure
+# refuses the install with a stderr diagnostic naming the failed key.
+#
+# Format is line-oriented text so the file is diff-inspectable and the
+# signing pipeline (`paideia-as release --sign` at the author side +
+# the paideia signing bot at the root-key side per §9.3) can populate
+# each field with a single line-edit. The manifest hash is over every
+# `payload:` line in canonical order (release_hash first, then the
+# nine `payload:` metadata lines) with SHA-256 per model.md §2.
+#
+# Signature discipline: both `author_sig` and `paideia_root_sig` are
+# 3293-byte ML-DSA-65 signatures (per model.md §2 + §11.2) encoded
+# base64 across a single line. The two placeholder-`<not-yet-signed>`
+# values below are the M5 shape-in-place: the format ships now so the
+# release-flow tooling can populate them once paideia-as v0.33-crypto
+# lands the `ml_dsa_65_sign` intrinsic (issues #1302-#1306 on paideia-
+# as; see the memory index at `project_paideia_as_bootstrap`). Every
+# other M5 artefact — the .pdxdoc, the CHANGELOG entry, the mirror-
+# push metadata — is complete and stable; only the two signature bytes
+# await the crypto intrinsic.
+
+package        = cp
+version        = 1.0.0
+release_date   = 2026-08-22
+paideia_as_min = 0.33
+kind           = tool
+
+# --- Release payload -------------------------------------------------
+# The nine payload lines below name every artefact the pkg fetcher
+# unpacks + installs. Each `payload:` line is `<repo-relative-path>
+# <sha256-hex-of-file-contents>`; the manifest hash below covers the
+# canonical (alphabetically-sorted-by-path) concatenation of these
+# lines. `<pending-build>` values below reflect that paideia-as build
+# has not been invoked in-tree at this commit (per the M5 no-build
+# constraint); the signing pipeline replaces each with the on-disk
+# sha256 at release-tag time (`paideia-as release --sign` at §9.3
+# step 2).
+
+payload: build-out/cp                          <pending-build>
+payload: build-out/cp.caps                     <pending-build>
+payload: caps.decl                             <pending-build>
+payload: manifest.pdxproj                      <pending-build>
+payload: doc/cp.pdxdoc                         <pending-build>
+payload: CHANGELOG.md                          <pending-build>
+payload: LICENSE                               <pending-build>
+payload: README.md                             <pending-build>
+payload: STATUS.md                             <pending-build>
+
+# --- Author signature block ------------------------------------------
+# The tool's author signs first with `user_sk` unlocked via the
+# Argon2id-KDF passphrase path (model.md §11.2). Fingerprint format
+# per `pkg keys` output (see pkg.M5-001): 32 hex chars of the SHA-256
+# over the raw 1952-byte ML-DSA-65 public key, lowercased, unspaced.
+
+author         = snunez
+author_pk_fp   = <pending-author-sign>
+author_sig     = <pending-author-sign>
+
+# --- Root signature block --------------------------------------------
+# The paideia signing bot (§9.3 step 4) re-signs after a reviewer
+# confirms the source-tree at the release tag matches the author's
+# staged tarball. The bot lives on the root-key-holding machine; its
+# policy is human-in-the-loop per §9.3.
+#
+# The `paideia_root_pk` fingerprint is a stable value across every
+# release the bot ever signs — it is the R32 root key (`design/user/
+# model.md` §2). `pkg keys` documents it on every user machine so a
+# user can independently verify the bot has not been swapped.
+
+paideia_root_pk_fp = <pending-root-sign>
+paideia_root_sig   = <pending-root-sign>
+
+# --- Manifest hash ---------------------------------------------------
+# SHA-256 hex over the canonical concatenation of every `payload:`
+# line above (sorted alphabetically by path), one line per record,
+# separated by `\n`. Every signature below covers this hash — not the
+# raw payload — so the signer never needs to buffer the full release
+# tarball to sign it. The line is regenerated whenever any `payload:`
+# line's hash changes (i.e. whenever the release tarball's contents
+# change); the two signatures are then re-issued over the new hash.
+
+manifest_hash  = <pending-build>
+
+# --- Release-flow gates (documentation-only) -------------------------
+# These lines are not consumed by `pkg install`; they are here so the
+# signing pipeline can assert that the release meets the M5 close
+# preconditions before it issues either signature. A future
+# `paideia-as release --lint` (post-R50) reads these + refuses to
+# release if any gate is unmet.
+#
+#   m4_close_commit  — the cp commit at which M4 closed (all M4
+#                       issues resolved, tests + smoke matrix landed).
+#   pdxdoc_present   — `doc/cp.pdxdoc` exists and lints clean under
+#                       `pdx-help lint` (§9.2 verify.sh).
+#   changelog_v1_0   — `CHANGELOG.md` has a `## 1.0.0 ...` heading
+#                       whose body enumerates every M1-M4 issue.
+#   pkg_m4_landed    — pkg.M4 has closed on `paideia-os/pkg` so that
+#                       `pkg install cp` is a runnable code path.
+#                       (Cross-repo dep per plan doc §5.6 line 554.)
+
+release_gates:
+  m4_close_commit  = eda1f55
+  pdxdoc_present   = true
+  changelog_v1_0   = true
+  pkg_m4_landed    = pending

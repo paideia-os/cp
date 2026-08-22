@@ -1,11 +1,11 @@
 # cp — paideia-as build manifest
 #
-# Wave: R50  Milestone: M4 (tests + smoke matrix — three test-spec
-#                            markdown files under tests/ covering the 18
-#                            matrix rows the plan §5.6 M4 line enumerates;
-#                            no cp code change at M4, observation hooks
-#                            already exposed by the M2/M3 modules)
-# Doc:   design/tooling/r49-r50-plan.md §5.6 in the paideia-os repo.
+# Wave: R50  Milestone: M5 (1.0 signed release — dual-signed
+#                            manifest.pdxsig, CHANGELOG-1.0 entry,
+#                            doc/cp.pdxdoc for `doc cp`, and mirror-push
+#                            manifest at .plans/pkgs-mirror-push.md.
+#                            Version bumped 0.4.0-m4 → 1.0.0.)
+# Doc:   design/tooling/r49-r50-plan.md §5.6 + §9.3 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
 # and lines starting with `#` are ignored. The M1 format is deliberately
@@ -19,11 +19,13 @@
 # build-out/cp.caps for the InitCap sidecar packaging step at M5.
 
 name        = cp
-version     = 0.4.0-m4
+version     = 1.0.0
 kind        = tool
 entry       = CpMain::cp_main
 output      = build-out/cp
 caps_decl   = caps.decl
+sig_file    = manifest.pdxsig
+doc_file    = doc/cp.pdxdoc
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------

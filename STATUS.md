@@ -1,7 +1,10 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests / smoke matrix) — complete
+**Current milestone:** M5 (1.0 signed release) — M5-001 landed
+**Version:** 1.0.0 (release-tag pending signing pipeline —
+`manifest.pdxsig` author + paideia_root fields are `<pending-*>`
+placeholders until paideia-as v0.33-crypto exposes `ml_dsa_65_sign`)
 
 ## Milestone map
 
@@ -54,9 +57,17 @@
   hook assertions compile against the current cp .bss symbol
   table; each spec's substrate-landing-gate table names the
   body-edit landing sites for the shape-in-place rows.
-- **M5 — 1.0 signed release (not started).** Dual-signed
-  manifest.pdxsig for cp v1.0 + CHANGELOG entry, pkgs.paideia-os
-  mirror push, .pdxdoc for `doc cp`.
+- **M5 — 1.0 signed release (M5-001 landed).** Dual-signed
+  `manifest.pdxsig` for cp v1.0 (signature bytes are
+  `<pending-author-sign>` / `<pending-root-sign>` placeholders,
+  ready for the signing pipeline to line-edit once paideia-as
+  v0.33-crypto lands `ml_dsa_65_sign`); `CHANGELOG.md` 1.0 entry
+  aggregating every M1-M5 issue; `doc/cp.pdxdoc` per I7 §2 for
+  `doc cp`. Version bumped 0.4.0-m4 → 1.0.0 in
+  `manifest.pdxproj`. M5-002 mirror push follows in the next
+  commit — `.plans/pkgs-mirror-push.md` names the URL layout at
+  `pkgs.paideia-os/main/cp/1.0.0/` and the staging → main
+  promotion path.
 
 See `design/tooling/r49-r50-plan.md` §5.6 in paideia-os for the full
 breakdown and cross-repo dependencies.
