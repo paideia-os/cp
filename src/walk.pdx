@@ -59,6 +59,16 @@
 // keeps the diagnostic minimal (one line naming the src dir); M3
 // upgrades it to a CopyProgressRecord[] emit via libpdx-semantic-pipe.
 //
+// M3-001 per-entry emission (deferred with readdir substrate)
+// -----------------------------------------------------------
+// walk_entry_todo below documents the CpPipe::cp_pipe_emit_progress
+// call site: after each per-entry copy_bytes_only succeeds, walk
+// emits one CopyProgressRecord (src=concat(rbx, entry.name),
+// dst=concat(r12, entry.name), bytes_copied=CopyFile::bytes_copied,
+// bytes_total=same at M3). The single-file path in
+// CopyFile::copy_bytes_only already emits its own record at M3, so
+// walk's per-entry emit lands together with the R42 readdir body-edit.
+//
 // paideia-as compliance
 // ---------------------
 //   - Module Walk (PascalCase basename).
@@ -235,6 +245,11 @@ module Walk = structure {
         //       call SignedInode::preserve_at_destination
         //             (cap-tail re-sign per M2-002; graceful degrade
         //              per M2-003)
+        //       call CpPipe::cp_pipe_emit_progress(entry_src, entry_dst,
+        //             CopyFile::bytes_copied, CopyFile::bytes_copied)
+        //             (M3-001 per-entry emission — record shape
+        //              identical to CopyFile::copy_bytes_only's
+        //              single-file emit)
         //   - Else if entry.type == directory:
         //       call Walk::walk_recursive(entry_src, entry_dst)  [self-recursion]
         //   - Else (symlink, device, socket, etc.):

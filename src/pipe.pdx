@@ -1,0 +1,310 @@
+// src/pipe.pdx — cp.M3-001
+// CpPipe module: CopyProgressRecord[] schema bind on stdout + per-file
+// emit via libpdx-semantic-pipe.
+//
+// Scope
+// -----
+// Plan §5.6 M3 line: `CopyProgressRecord[] per file (or per N MiB
+// block on large files) via libpdx-semantic-pipe`. cp emits one
+// CopyProgressRecord per successfully-copied file so a downstream
+// pipeline consumer can filter, sort, or plot by structured field
+// rather than parse text.
+//
+// Schema — CopyProgressRecord@0.1
+// -------------------------------
+// The record is a fixed 40-byte payload (five u64 fields, natural
+// 8-byte alignment) matching the plan §4 field list:
+//
+//   offset 0   src_path       u64  VA of NUL-terminated src path
+//   offset 8   dst_path       u64  VA of NUL-terminated dst path
+//   offset 16  bytes_copied   u64  actual bytes written to dst
+//   offset 24  bytes_total    u64  expected byte count (== bytes_copied
+//                                    on success; may differ during
+//                                    partial-write reporting once
+//                                    per-block emission lands at M4)
+//   offset 32  elapsed_ns     u64  M3 placeholder = 0; M4 wires a real
+//                                    clock read once the KIND_TIMER
+//                                    substrate exposes ring-3 access.
+//
+// Path pointers are shipped by VA rather than by copied byte content
+// because (a) the record stays fixed-size, (b) the receiver (in the
+// same address space until pipeline crossings introduce cap-transfer)
+// dereferences without needing to know a max-path length, (c) M4's
+// pipeline-crossing marshaling replaces the VA with an inline
+// length-prefixed byte copy inside a widened record format.
+//
+// Schema hash
+// -----------
+// COPY_PROGRESS_SCHEMA_HASH is a 32-byte BLAKE3-truncated digest of
+// the canonical schema declaration string
+// "CopyProgressRecord@0.1{src_path:u64,dst_path:u64,bytes_copied:u64,bytes_total:u64,elapsed_ns:u64}".
+// M3 uses a deterministic placeholder derived from the string
+// "CopyProgressRecord@0.1" — the byte layout of the placeholder is
+// documented in the .rodata literal below. At M4 the svc.schema-
+// registry lookup replaces the placeholder with the registry-issued
+// canonical hash (see libpdx-semantic-pipe.M3-001 §schema-registry).
+//
+// Two libpdx-semantic-pipe primitives are consumed
+// ------------------------------------------------
+//   Binding::libpdx_semantic_pipe_bind(fd, schema_id) -> SP_OK|err
+//     Called once at cp_main entry to bind fd 1 (stdout) to the
+//     CopyProgressRecord schema hash. Idempotent for the same
+//     (fd, hash) pair — safe to invoke every process start.
+//
+//   Send::send_record(fd, rec_ptr, rec_len) -> SP_SEND_OK|err
+//     Called after each successful copy_bytes_only completion to
+//     emit the CopyProgressRecord. Composes the R20b frame header
+//     + schema hash prefix + record body and issues sys_ipc_send
+//     internally.
+//
+// D2 (semantic pipes) upgrade path
+// --------------------------------
+// M3 emits ONE record per invocation (from copy_bytes_only after the
+// read/write loop). M4 extends to per-file emission inside
+// walk_recursive's per-entry body once the R42 readdir substrate
+// lands. The emit call site inside walk.pdx is a body-edit landing
+// site — the call shape (rdi=src, rsi=dst, rdx=bytes_copied,
+// rcx=bytes_total) matches this module's cp_pipe_emit_progress
+// signature verbatim so the M4 landing does not restructure this
+// module.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CpPipe (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest immediate: 40 for
+//     COPY_PROGRESS_REC_LEN).
+//   - r11 is scratch (every lea for .bss / .rodata addresses).
+//   - cp_pipe_bind_stdout is non-leaf (calls
+//     Binding::libpdx_semantic_pipe_bind). 1-push prologue (rbx for
+//     rsp alignment; unused body-side).
+//   - cp_pipe_emit_progress is non-leaf (calls Send::send_record).
+//     6-push prologue (rbx = fd_stdout, r12 = src_path, r13 = dst_path,
+//     r14 = bytes_copied, r15 = bytes_total) plus a `sub rsp, 8` pad
+//     keeps rsp%16 == 0 at the nested call site. Fields are staged
+//     into cp_progress_rec before the Send call.
+//   - No byte reads (all qword-wide field writes).
+
+module CpPipe = structure {
+
+  // -- Record layout constants ------------------------------------------
+  pub let COPY_PROGRESS_REC_LEN : u64 = 40
+
+  // -- Fixed VA of stdout — POSIX-conventional fd 1. paideia-os init
+  // -- seeds fd 0/1/2 at first ring-3 entry (see Print module header).
+  pub let FD_STDOUT : u64 = 1
+
+  // -- Schema hash — 32 bytes = 4 qwords. Placeholder-derived-from-
+  // -- string "CopyProgressRecord@0.1" — a deterministic prefix that
+  // -- lets M4 tests recognise the M3 placeholder in the wire dump.
+  //
+  // Byte layout: the ASCII bytes of "CopyProgressRecord@0.1" fill the
+  // first 22 bytes; the remaining 10 bytes are zero. The M4 svc.
+  // schema-registry lookup replaces this with the registry-issued
+  // canonical BLAKE3-truncated digest.
+  pub let COPY_PROGRESS_SCHEMA_HASH : [u8; 32] =
+    "CopyProgressRecord@0.1\0\0\0\0\0\0\0\0\0\0"
+
+  // -- Record composition buffer. 40 bytes = 5 * u64. .bss slot so
+  // -- the send_record call marshals from stable storage.
+  pub let mut cp_progress_rec : [u8; 40] = uninit @align(8)
+
+  // -- Counter slots for M4 test observability. Bumped at each emit
+  // -- gate; distinguishes "bind refused" from "send refused" so a
+  // -- test can assert both edges.
+  pub let mut pipe_binds       : u64 = uninit @align(8)  // successful binds
+  pub let mut pipe_emits       : u64 = uninit @align(8)  // successful emits
+  pub let mut pipe_bind_errors : u64 = uninit @align(8)  // bind failures
+  pub let mut pipe_emit_errors : u64 = uninit @align(8)  // send failures
+
+  // ============================================================================
+  // cp_pipe_reset()
+  //
+  // Signature: cp_pipe_reset : () -> () !{mem} @{}
+  //
+  // Zero the four counter slots so a subsequent cp invocation starts
+  // from a known baseline. cp_progress_rec is index-consumed (every
+  // field is stored before send) so it does not need zeroing.
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let cp_pipe_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M3-001 CpPipe::cp_pipe_reset. Zero the four counter slots (pipe_binds / pipe_emits / pipe_bind_errors / pipe_emit_errors) so cp_pipe_bind_stdout + cp_pipe_emit_progress accumulators start from a known baseline. Leaf; r11 scratch. cp_progress_rec is index-consumed (every field written before send) so no zeroing needed. Mirror of Undo::undo_reset shape.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + pipe_binds];       mov [r11], rax;
+        lea r11, [rip + pipe_emits];       mov [r11], rax;
+        lea r11, [rip + pipe_bind_errors]; mov [r11], rax;
+        lea r11, [rip + pipe_emit_errors]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cp_pipe_bind_stdout() -> SP_OK | err
+  //
+  // Signature: cp_pipe_bind_stdout : () -> u64 !{mem} @{}
+  // RAX (output): SP_OK (0) on success; libpdx-semantic-pipe bind
+  //               error code on failure (SP_ERR_INVALID_FD (1),
+  //               SP_ERR_NULL_HASH (2), SP_ERR_ALREADY_BOUND (3),
+  //               SP_ERR_TABLE_FULL (4)).
+  //
+  // Bind stdout (fd 1) to the CopyProgressRecord@0.1 schema hash.
+  // Called once at CpMain::cp_main entry, before any dispatch or
+  // emission. Idempotent for the same (fd 1, hash) pair — safe to
+  // invoke on every process start even under a hypothetical
+  // re-execve pattern.
+  //
+  // Bumps pipe_binds on success, pipe_bind_errors on any non-zero
+  // return. cp does not treat bind failure as fatal at M3 — the
+  // emit path itself is gated internally so a missing bind is
+  // recoverable (the send_record returns SP_SEND_ERR_NOT_BOUND
+  // which pipe_emit_progress translates to a counter bump without
+  // aborting the outer copy).
+  //
+  // Register plan (non-leaf; 1-push prologue for alignment):
+  //   rbx = pushed for rsp%16==0 alignment (unused body-side)
+  //   rax = bind return code
+  //   rdi = fd arg (FD_STDOUT)
+  //   rsi = schema_id arg (&COPY_PROGRESS_SCHEMA_HASH)
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let cp_pipe_bind_stdout : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M3-001 CpPipe::cp_pipe_bind_stdout. Bind fd 1 (stdout, FD_STDOUT) to the 32-byte CopyProgressRecord@0.1 schema hash via Binding::libpdx_semantic_pipe_bind. Non-leaf: 1-push prologue (rbx for rsp%16==0 alignment; unused body-side) matches CpFlags::register_cp_flags shape. Bind is idempotent for the same (fd, hash) pair (see libpdx-semantic-pipe binding.pdx §libpdx_semantic_pipe_bind idempotency clause) so a re-entry is safe. Success (rax == 0) bumps pipe_binds; failure bumps pipe_bind_errors. cp does not treat bind failure as fatal at M3 — the emit path is gated internally via SP_SEND_ERR_NOT_BOUND translation. Every immediate ≤ 0x7FFFFFFF (only 0 appears in cmp). No test mnemonic; no byte reads.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+
+        mov rdi, 1;                            // FD_STDOUT
+        lea rsi, [rip + COPY_PROGRESS_SCHEMA_HASH];
+        call Binding::libpdx_semantic_pipe_bind;
+        cmp rax, 0;
+        jne cp_pipe_bind_err;
+
+        // Success — bump pipe_binds.
+        lea r11, [rip + pipe_binds];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+        xor rax, rax;                          // SP_OK
+        pop rbx;
+        ret;
+
+      cp_pipe_bind_err:
+        // Bump pipe_bind_errors; return the underlying bind rc.
+        lea r11, [rip + pipe_bind_errors];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+        // rax already holds the bind rc.
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // cp_pipe_emit_progress(src_path, dst_path, bytes_copied, bytes_total) -> rc
+  //
+  // Signature: cp_pipe_emit_progress : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap}
+  // RDI (input): src_path      — VA of NUL-terminated src path
+  // RSI (input): dst_path      — VA of NUL-terminated dst path
+  // RDX (input): bytes_copied  — actual bytes written to dst
+  // RCX (input): bytes_total   — expected byte count
+  // RAX (output): SP_SEND_OK (0) on success; Send::send_record rc
+  //               (100..105 range) on failure.
+  //
+  // Flow:
+  //   1. Marshal the 5-u64 CopyProgressRecord@0.1 record into
+  //      cp_progress_rec[0..40]. elapsed_ns = 0 (M3 placeholder).
+  //   2. Call Send::send_record(FD_STDOUT, &cp_progress_rec, 40).
+  //   3. Success (rax == 0): bump pipe_emits; return 0.
+  //      Failure: bump pipe_emit_errors; return the underlying rc.
+  //
+  // Register plan (non-leaf; 6-push prologue for callee-save +
+  // alignment):
+  //   rbx = pushed for alignment (unused body-side beyond the pad)
+  //   r12 = src_path (preserved across the marshal + send call)
+  //   r13 = dst_path (preserved across the marshal + send call)
+  //   r14 = bytes_copied (preserved)
+  //   r15 = bytes_total (preserved)
+  //   rbp = pushed for parity (unused; kept so the 6-push shape
+  //         matches libpdx-audit's audit_send_record convention)
+  //   sub rsp, 8 (pad) keeps rsp%16 == 0 at the nested call site
+  //
+  // rsp arithmetic:
+  //   entry:               rsp % 16 == 8
+  //   after 6 pushes:      rsp % 16 == 8 (56 bytes = 6*8+8 nope — 6*8=48 → 8+48=56, 56%16=8)
+  //   after sub rsp, 8:    rsp % 16 == 0  ← send_record call site
+  //   epilogue reverses.
+  // ============================================================================
+  pub let cp_pipe_emit_progress : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (src_path: u64) (dst_path: u64) (bytes_copied: u64) (bytes_total: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "cp.M3-001 CpPipe::cp_pipe_emit_progress. Marshal five u64 fields (src_path, dst_path, bytes_copied, bytes_total, elapsed_ns=0) into cp_progress_rec[0..40] then call Send::send_record(FD_STDOUT=1, &cp_progress_rec, 40). Non-leaf: 6-push prologue (rbx pad + r12=src + r13=dst + r14=bytes_copied + r15=bytes_total + rbp pad) + `sub rsp, 8` = 56 bytes plus 8-byte pad = 64; entry rsp%16 == 8; after 6*8+8 = 56 bytes and adding sub 8 = 64 bytes; 8+64 = 72; 72%16 == 8. Correction: entry rsp%16 == 8; 6 pushes add 48 (%16 == 8+48 mod 16 = 8+0 = 8); sub rsp,8 → %16 == 0 for the nested call. Every field marshal uses `mov [r11 + N*8], reg` after `lea r11, [rip + cp_progress_rec]` — the paideia-as-compliant idiom for aligned .bss array writes. elapsed_ns = 0 (M3 placeholder) written via xor rax,rax; mov [r11+32], rax. Send::send_record returns SP_SEND_OK (0) on success or 100..105 on failure — success bumps pipe_emits; failure bumps pipe_emit_errors and returns the underlying rc verbatim so a caller can distinguish invalid_fd / null_rec / too_long / not_bound / null_hdr / null_payload if it chooses to gate on the rc (cp today does not). Effect envelope !{mem, sysreg} @{cap} matches Send::send_record's tail (mem for the marshal + syscall bounce; sysreg for SYSCALL clobber; cap for the KIND_IPC_ENDPOINT consume). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (only 0 appears in cmp; largest constant elsewhere is 40 = REC_LEN). No test mnemonic; no byte reads (all qword field writes).",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+        push r14;                              // rsp%16: 0 → 8
+        push r15;                              // rsp%16: 8 → 0
+        push rbp;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov r12, rdi;                          // r12 = src_path
+        mov r13, rsi;                          // r13 = dst_path
+        mov r14, rdx;                          // r14 = bytes_copied
+        mov r15, rcx;                          // r15 = bytes_total
+
+        // ---- Marshal 5 u64 fields into cp_progress_rec ----------------------
+        lea r11, [rip + cp_progress_rec];
+        mov [r11 + 0],  r12;                   // src_path
+        mov [r11 + 8],  r13;                   // dst_path
+        mov [r11 + 16], r14;                   // bytes_copied
+        mov [r11 + 24], r15;                   // bytes_total
+        xor rax, rax;
+        mov [r11 + 32], rax;                   // elapsed_ns = 0 (M3 placeholder)
+
+        // ---- Send::send_record(FD_STDOUT, &cp_progress_rec, 40) --------------
+        mov rdi, 1;                            // FD_STDOUT
+        lea rsi, [rip + cp_progress_rec];      // rec_ptr
+        mov rdx, 40;                           // COPY_PROGRESS_REC_LEN
+        call Send::send_record;
+        cmp rax, 0;
+        jne cp_pipe_emit_err;
+
+        // Success — bump pipe_emits.
+        lea r11, [rip + pipe_emits];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+        xor rax, rax;                          // SP_SEND_OK
+        jmp cp_pipe_emit_epilogue;
+
+      cp_pipe_emit_err:
+        // Bump pipe_emit_errors; return the underlying send rc.
+        // rax already holds the send_record rc.
+        push rax;                              // preserve rc across counter bump
+        lea r11, [rip + pipe_emit_errors];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+        pop rax;
+
+      cp_pipe_emit_epilogue:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

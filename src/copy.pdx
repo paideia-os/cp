@@ -1,4 +1,5 @@
 // src/copy.pdx — cp.M1-003 + cp.M2-004 (TXN-hoist extract)
+//                + cp.M3-001 (CopyProgressRecord emit)
 // CopyFile module: single-file copy body.
 //
 // Scope
@@ -64,6 +65,10 @@
 //   Pdxfs::pdxfs_open, pdxfs_read, pdxfs_write, pdxfs_close
 //   Pdxfs::pdxfs_txn_begin, pdxfs_txn_commit
 //   Print::print_err
+//   Undo::maybe_record_over_existing           (this repo)  [M2-005]
+//   SignedInode::preserve_at_destination        (this repo)  [M2-002/003]
+//   CpPipe::cp_pipe_emit_progress               (this repo)  [M3-001]
+//   CpPipe::bytes_copied (via .bss read)        (this repo)  [M3-001]
 //
 // paideia-as compliance
 // ---------------------
@@ -321,6 +326,23 @@ module CopyFile = structure {
         // here at M2 — the call is fire-and-continue.
         mov rdi, r12;                          // dst_ptr
         call SignedInode::preserve_at_destination;
+
+        // ---- Step 8 (M3-001): emit CopyProgressRecord on stdout -------------
+        // rbx = src_path, r12 = dst_path (both preserved across the
+        // read/write loop by the 5-push prologue). bytes_copied lives
+        // in .bss; bytes_total == bytes_copied at M3 (a distinct total
+        // arrives at M4 with pdxfs_stat integration). The emit return
+        // is deliberately ignored — pipe_emit_errors is bumped
+        // internally on failure but the byte content of the copy is
+        // authoritative for cp semantics; a missing progress record
+        // is a shape-in-place condition today (broker daemon not yet
+        // running), not a copy failure.
+        mov rdi, rbx;                          // src_path
+        mov rsi, r12;                          // dst_path
+        lea r11, [rip + bytes_copied];
+        mov rdx, [r11];                        // bytes_copied
+        mov rcx, rdx;                          // bytes_total = bytes_copied
+        call CpPipe::cp_pipe_emit_progress;
 
         xor rax, rax;                          // EXIT_OK (0)
         jmp copy_epilogue;
