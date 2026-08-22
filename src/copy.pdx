@@ -1,23 +1,36 @@
-// src/copy.pdx — cp.M1-003
+// src/copy.pdx — cp.M1-003 + cp.M2-004 (TXN-hoist extract)
 // CopyFile module: single-file copy body.
 //
 // Scope
 // -----
-// M1's first-runnable shape: `cp a b` opens the source read-only,
-// opens the destination with O_CREAT | O_WRONLY, wraps both opens
-// between a pdxfs_txn_begin / pdxfs_txn_commit pair (M1 stubs; real
-// at M2), streams bytes through a 4 KiB .bss scratch buffer until
-// source EOF, closes both fds, commits, and returns 0. On any
-// syscall error, cp prints a one-line diagnostic on stderr, closes
-// whichever fds are open, and returns 1 (EXIT_OP_FAIL).
+// M1 first-runnable shape: `cp a b` opened the source read-only,
+// opened the destination with O_CREAT | O_WRONLY, wrapped both opens
+// between a pdxfs_txn_begin / pdxfs_txn_commit pair (M1 stubs),
+// streamed bytes through a 4 KiB .bss scratch buffer until source
+// EOF, closed both fds, committed, and returned 0.
 //
-// The TXN pair at M1 does nothing (stub returns 0 unconditionally,
-// see src/pdxfs.pdx). Wrapping the real work between begin/commit at
-// M1 is deliberate: the M2 patch that lands the real TXN body needs
-// only to swap the two stub bodies in pdxfs.pdx — no restructure of
-// this file. At M2, an error path inside the read/write loop will
-// gain a pdxfs_txn_abort() call before its print+return; today the
-// abort is a no-op that we do not bother inserting.
+// M2-004 hoists the KIND_PDXFS_TXN wrap to dispatch level so a
+// single outer TXN spans the whole invocation — both single-file and
+// recursive `-r` paths run inside one TXN, and any failure aborts
+// every already-written destination byte at the TXN boundary
+// (dispatch calls pdxfs_txn_abort on body-failure return). This
+// module now exposes:
+//
+//   copy_bytes_only(src_ptr, dst_ptr) -> exit_code
+//     M2-004 NEW. The M1 body minus the TXN begin/commit pair. Called
+//     by dispatch's single-file arm and (once walk_entry_todo lands)
+//     by Walk::walk_recursive per regular-file entry.
+//
+//   copy_single_file(src_ptr, dst_ptr) -> exit_code
+//     Backward-compatible alias for copy_bytes_only. Kept because
+//     documentation, tests, and the M1 callsite name reference it;
+//     forwards to copy_bytes_only with no additional work.
+//
+// The M2-004 dispatch-level TXN wrap means the two TXN failure
+// branches (copy_txn_begin_fail / copy_txn_commit_fail) migrate out
+// of this file entirely — see Dispatch::dispatch_copy for the new
+// begin/commit/abort call sites. This module's error branches are
+// exclusively the read/write/short-write/open-src/open-dst family.
 //
 // Storage model
 // -------------
@@ -104,9 +117,11 @@ module CopyFile = structure {
     "cp: short write to destination (partial state)\n"
   pub let SHORT_WRITE_MSG_LEN : u64 = 47
 
-  // These two are unreachable at M1 (pdxfs_txn_begin / _commit return 0
-  // unconditionally) but present so the M2 upgrade is a body edit in
-  // pdxfs.pdx rather than a structural edit here.
+  // Retained for source-level continuity across the M1→M2 transition;
+  // the M2-004 dispatch-level TXN wrap means the TXN failure
+  // diagnostics now emit from Dispatch::dispatch_copy (see
+  // dispatch.pdx TXN_BEGIN_FAIL_MSG / TXN_COMMIT_FAIL_MSG). No M2
+  // code path in this module emits either string.
   pub let TXN_BEGIN_FAIL_MSG : [u8; 29] =
     "cp: transaction begin failed\n"
   pub let TXN_BEGIN_FAIL_MSG_LEN : u64 = 29
@@ -141,51 +156,60 @@ module CopyFile = structure {
     }
 
   // ============================================================================
-  // copy_single_file(src_ptr, dst_ptr) -> exit_code
+  // copy_bytes_only(src_ptr, dst_ptr) -> exit_code
   //
-  // Signature: copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // Signature: copy_bytes_only : (u64, u64) -> u64 !{mem, sysreg} @{}
   // RDI (input): src_ptr — VA of a NUL-terminated source path
   // RSI (input): dst_ptr — VA of a NUL-terminated destination path
   // RAX (output): 0 on success, 1 on any syscall error
   //
+  // NEW at M2-004. The M1 copy_single_file body with the TXN begin /
+  // commit pair removed (see file-header note on the M2-004 TXN hoist).
+  // Dispatch::dispatch_copy now opens the outer TXN once per invocation
+  // before calling this entry, and calls pdxfs_txn_abort on any body
+  // failure. Walk::walk_recursive (once its per-entry body lands) calls
+  // this same entry per regular-file entry, still inside the one outer
+  // TXN.
+  //
   // Body flow:
   //   1. copy_reset
-  //   2. pdxfs_txn_begin — M1 stub; the return is checked so the M2
-  //      body-edit does not have to add a check-site.
-  //   3. pdxfs_open(src_ptr, O_RDONLY = 0)         → r13 = fd_src
-  //   4. pdxfs_open(dst_ptr, O_WRONLY|O_CREAT = 0x41) → r14 = fd_dst
-  //   5. Read/write loop until source EOF (n == 0).
-  //   6. Close dst, close src (return codes ignored — an fd release
+  //   2. pdxfs_open(src_ptr, O_RDONLY = 0)             → r13 = fd_src
+  //   3. pdxfs_open(dst_ptr, O_WRONLY|O_CREAT = 0x41)  → r14 = fd_dst
+  //   4. Read/write loop until source EOF (n == 0).
+  //   5. Close dst, close src (return codes ignored — an fd release
   //      error is not something cp's caller can act on).
-  //   7. pdxfs_txn_commit — M1 stub; the return is checked so M2's
-  //      real commit path has a landing site.
-  //   8. Return 0.
+  //   6. Return 0.
   //
   // Error branches
   // --------------
-  //   copy_txn_begin_fail    — before any open; print + return 1.
-  //   copy_open_src_fail     — no fds open; print + return 1.
-  //   copy_open_dst_fail     — close fd_src; print + return 1.
-  //   copy_read_fail         — close fd_dst + fd_src; print + return 1.
-  //   copy_write_fail        — close fd_dst + fd_src; print + return 1.
-  //   copy_short_write       — close fd_dst + fd_src; print + return 1.
-  //   copy_txn_commit_fail   — fds already closed on success arm;
-  //                             print + return 1. Unreachable at M1
-  //                             (stub returns 0) but present for M2.
+  //   copy_open_src_fail  — no fds open; print + return 1.
+  //   copy_open_dst_fail  — close fd_src; print + return 1.
+  //   copy_read_fail      — close fd_dst + fd_src; print + return 1.
+  //   copy_write_fail     — close fd_dst + fd_src; print + return 1.
+  //   copy_short_write    — close fd_dst + fd_src; print + return 1.
   //
   // Every error branch shares a single copy_epilogue so the 5-pop
-  // teardown is expressed once.
+  // teardown is expressed once. On error, control returns to
+  // Dispatch::dispatch_copy with rax=1, which triggers the outer
+  // pdxfs_txn_abort call — the partial destination bytes get unwound
+  // at the TXN boundary.
   //
-  // M2 will add pdxfs_txn_abort() before the return in each error
-  // branch; today the abort is a no-op that would only add call
-  // instructions with no observable effect. The plan doc §5.6 M2
-  // line calls this out as the "single-TXN atomicity across whole
-  // invocation (partial rollback)" landing.
+  // The two TXN failure branches from the M1 shape (copy_txn_begin_fail
+  // and copy_txn_commit_fail) are migrated to dispatch.pdx at M2-004.
+  //
+  // Register plan (5-push prologue → rsp%16 == 0 at every nested call):
+  //   rbx = src_ptr    (preserved across every call)
+  //   r12 = dst_ptr    (preserved across every call)
+  //   r13 = fd_src     (from pdxfs_open; preserved across every call)
+  //   r14 = fd_dst     (from pdxfs_open; preserved across every call)
+  //   r15 = last_n     (bytes returned by the current pdxfs_read; the
+  //                     write-length for the matching pdxfs_write and
+  //                     the short-write comparison target)
   // ============================================================================
-  pub let copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{} =
+  pub let copy_bytes_only : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M1-003 copy_single_file. First-runnable single-file copy: open src (O_RDONLY=0), open dst (O_WRONLY|O_CREAT=0x41), stream through 4KiB .bss buffer copy_buf until EOF, close both, commit TXN, return 0. TXN begin/commit are M1 stubs in Pdxfs (return 0 unconditionally) — wrapping real work between them is deliberate so the M2 patch changes only Pdxfs bodies, no restructure here. 5-push prologue (rbx=src_ptr, r12=dst_ptr, r13=fd_src, r14=fd_dst, r15=last_n) lands rsp%16==0 at every nested call site; every long-lived value crosses at least one pdxfs_* call and therefore lives in a callee-save reg. Error path structure: seven distinct branches (copy_txn_begin_fail / copy_open_src_fail / copy_open_dst_fail / copy_read_fail / copy_write_fail / copy_short_write / copy_txn_commit_fail) each close whatever fds are open (0/1/2 fds depending on where the error hit), print one line on stderr via Print::print_err, and jump to copy_epilogue which restores the 5-push callee-save state and returns with rax=1 (EXIT_OP_FAIL). Success path returns via xor rax,rax; jmp copy_epilogue. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF: 0 (zero checks), 0x40 (O_CREAT), 0x41 (O_WRONLY|O_CREAT), 4096 (COPY_BUF_LEN). Negative-errno detection uses `cmp rax, 0; jl` (signed compare — SF set from rax bit 63) so the u64 sentinel does not need immediate staging. The bytes_copied accumulator uses r11+rcx: lea r11 to bytes_copied; mov rcx, [r11]; add rcx, rax; mov [r11], rcx — three-instruction read-modify-write with r11 scratch discipline. sysreg effect declared for the syscall clobber shape.",
+      justification: "cp.M2-004 copy_bytes_only. The M1 copy_single_file body with the TXN begin/commit pair extracted to dispatch level (see cp.M2-004 file-header note). Open src (O_RDONLY=0), open dst (O_WRONLY|O_CREAT=0x41), stream through 4KiB .bss buffer copy_buf until EOF, close both, return 0. The outer KIND_PDXFS_TXN is opened once at Dispatch::dispatch_copy for the whole invocation (single-file or recursive) and closed with commit on success or abort on any body failure — so a partial write from this function unwinds at the TXN boundary without needing a per-function abort call. 5-push prologue (rbx=src_ptr, r12=dst_ptr, r13=fd_src, r14=fd_dst, r15=last_n) lands rsp%16==0 at every nested call site; every long-lived value crosses at least one pdxfs_* call and therefore lives in a callee-save reg. Five error branches (copy_open_src_fail / copy_open_dst_fail / copy_read_fail / copy_write_fail / copy_short_write) each close whatever fds are open (0/1/2 fds), print one line on stderr, and jump to copy_epilogue with rax=1. Success returns via xor rax,rax; jmp copy_epilogue. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (0x40=O_CREAT / 0x41=O_WRONLY|O_CREAT / 4096=COPY_BUF_LEN). Negative-errno detection uses `cmp rax, 0; jl` (signed compare). sysreg effect for syscall clobber.",
       block: {
         // ---- Prologue --------------------------------------------------------
         push rbx;                              // rsp%16: 8 → 0
@@ -200,12 +224,7 @@ module CopyFile = structure {
         // ---- Step 1: reset state --------------------------------------------
         call CopyFile::copy_reset;
 
-        // ---- Step 2: begin TXN (M1 stub returns 0) --------------------------
-        call Pdxfs::pdxfs_txn_begin;
-        cmp rax, 0;
-        jl copy_txn_begin_fail;
-
-        // ---- Step 3: open source (O_RDONLY = 0) -----------------------------
+        // ---- Step 2: open source (O_RDONLY = 0) -----------------------------
         mov rdi, rbx;                          // src_ptr
         mov rsi, 0;                            // O_RDONLY
         call Pdxfs::pdxfs_open;
@@ -216,7 +235,7 @@ module CopyFile = structure {
         lea r11, [rip + fd_src];
         mov [r11], rax;
 
-        // ---- Step 4: open destination (O_WRONLY | O_CREAT = 0x41) -----------
+        // ---- Step 3: open destination (O_WRONLY | O_CREAT = 0x41) -----------
         mov rdi, r12;                          // dst_ptr
         mov rsi, 0x41;                         // O_WRONLY | O_CREAT
         call Pdxfs::pdxfs_open;
@@ -227,7 +246,7 @@ module CopyFile = structure {
         lea r11, [rip + fd_dst];
         mov [r11], rax;
 
-        // ---- Step 5: read/write loop ----------------------------------------
+        // ---- Step 4: read/write loop ----------------------------------------
       copy_loop_head:
         // pdxfs_read(fd_src, copy_buf, COPY_BUF_LEN)
         mov rdi, r13;                          // fd_src
@@ -261,48 +280,31 @@ module CopyFile = structure {
 
         jmp copy_loop_head;
 
-        // ---- Step 6+7+8: success epilogue (EOF, close, commit, return 0) ----
+        // ---- Step 5+6: success epilogue (EOF, close, return 0) --------------
       copy_eof:
         // Close dst first, then src. Return values ignored (a close
-        // error on the M1 substrate is not something the caller can
+        // error on the M2 substrate is not something the caller can
         // do anything about; the fd is released at task teardown
-        // regardless).
+        // regardless). The outer TXN commit happens in dispatch.
         mov rdi, r14;
         call Pdxfs::pdxfs_close;
 
         mov rdi, r13;
         call Pdxfs::pdxfs_close;
 
-        // Commit TXN (M1 stub returns 0).
-        call Pdxfs::pdxfs_txn_commit;
-        cmp rax, 0;
-        jl copy_txn_commit_fail;
-
         xor rax, rax;                          // EXIT_OK (0)
         jmp copy_epilogue;
 
         // ---- Error branches -------------------------------------------------
         // Ordered by "how many fds are open at this point":
-        //   0 fds: copy_txn_begin_fail, copy_open_src_fail
+        //   0 fds: copy_open_src_fail
         //   1 fd  (fd_src): copy_open_dst_fail
         //   2 fds:          copy_read_fail, copy_write_fail, copy_short_write
-        //   2 fds already closed: copy_txn_commit_fail
-        //
-        // M2 will add a pdxfs_txn_abort() call before each print here
-        // once that entry point exists in Pdxfs; today the abort is a
-        // no-op so it is omitted.
-      copy_txn_begin_fail:
-        lea rdi, [rip + TXN_BEGIN_FAIL_MSG];
-        mov rsi, 29;                           // TXN_BEGIN_FAIL_MSG_LEN
-        call Print::print_err;
-        mov rax, 1;                            // EXIT_OP_FAIL
-        jmp copy_epilogue;
-
       copy_open_src_fail:
         lea rdi, [rip + OPEN_SRC_FAIL_MSG];
         mov rsi, 28;                           // OPEN_SRC_FAIL_MSG_LEN
         call Print::print_err;
-        mov rax, 1;
+        mov rax, 1;                            // EXIT_OP_FAIL
         jmp copy_epilogue;
 
       copy_open_dst_fail:
@@ -352,22 +354,41 @@ module CopyFile = structure {
         mov rax, 1;
         jmp copy_epilogue;
 
-      copy_txn_commit_fail:
-        // fds already closed on the success arm before commit was
-        // attempted; nothing to close here. Unreachable at M1
-        // (stub returns 0) but present for M2.
-        lea rdi, [rip + TXN_COMMIT_FAIL_MSG];
-        mov rsi, 30;                           // TXN_COMMIT_FAIL_MSG_LEN
-        call Print::print_err;
-        mov rax, 1;
-        jmp copy_epilogue;
-
         // ---- Shared epilogue ------------------------------------------------
       copy_epilogue:
         pop r15;
         pop r14;
         pop r13;
         pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // copy_single_file(src_ptr, dst_ptr) -> exit_code
+  //
+  // Signature: copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{}
+  //
+  // M1 entry-point name kept for backward source compatibility and for
+  // the M4 test-target vocabulary. At M2-004 this is a thin forwarder:
+  // it calls copy_bytes_only and returns its exit code untouched. The
+  // TXN begin/commit that used to live here migrated to dispatch level
+  // (see file-header M2-004 note).
+  //
+  // Non-leaf: 1-push prologue (rbx unused body-side; pushed to align
+  // rsp%16 to 0 for the nested call).
+  // ============================================================================
+  pub let copy_single_file : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M2-004 copy_single_file forwarder. M1 entry-point name preserved for source-level continuity and M4 test-target vocabulary. At M2-004 the TXN begin/commit hoisted to dispatch level, leaving this function as a thin call-through to copy_bytes_only. 1-push prologue (rbx unused; for rsp alignment). Same signature + semantics as the M1 entry; the outer TXN wrap now lives at Dispatch::dispatch_copy.",
+      block: {
+        push rbx;                              // align rsp for nested call
+
+        call CopyFile::copy_bytes_only;
+        // rax carries copy_bytes_only's exit code (0 or 1).
+
         pop rbx;
         ret
       }

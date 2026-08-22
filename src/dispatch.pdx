@@ -1,6 +1,8 @@
 // src/dispatch.pdx — cp.M1-002 (bodies) + cp.M1-003 (happy-arm wire)
 //                    + cp.M2-001 (typed flags + recursive route)
-// Dispatch module: flag gate + positional-count validate + route.
+//                    + cp.M2-004 (single-TXN hoist across whole invocation)
+// Dispatch module: flag gate + positional-count validate + route +
+// outer KIND_PDXFS_TXN wrap.
 //
 // Scope
 // -----
@@ -31,8 +33,11 @@
 //   CpFlags::populate            (this repo, src/flags.pdx)
 //   CpFlags::flags_reset         (this repo, src/flags.pdx)
 //   CpFlags::flag_recursive_seen (this repo, src/flags.pdx)
-//   CopyFile::copy_single_file   (this repo, src/copy.pdx)
+//   CopyFile::copy_bytes_only    (this repo, src/copy.pdx)  [M2-004: was copy_single_file]
 //   Walk::walk_recursive         (this repo, src/walk.pdx)
+//   Pdxfs::pdxfs_txn_begin       (this repo, src/pdxfs.pdx) [M2-004: TXN wrap]
+//   Pdxfs::pdxfs_txn_commit      (this repo, src/pdxfs.pdx) [M2-004: TXN wrap]
+//   Pdxfs::pdxfs_txn_abort       (this repo, src/pdxfs.pdx) [M2-004: partial rollback]
 //   Print::print_err             (this repo, src/print.pdx)
 //
 // paideia-as compliance
@@ -84,6 +89,22 @@ module Dispatch = structure {
     "cp: copy body not implemented at M1-002 (lands at M1-003)\n"
   pub let COPY_STUB_MSG_LEN : u64 = 58
 
+  // -- TXN failure diagnostics (M2-004) ---------------------------------
+  //
+  // Migrated from CopyFile at M2-004 when the KIND_PDXFS_TXN wrap
+  // hoisted from copy_single_file to this dispatch level. Emitted on
+  // outer-TXN failure — cp exits with EXIT_OP_FAIL (1) when either
+  // begin or commit fails. The abort call on body-failure is silent;
+  // its return is ignored because there is no useful action cp can
+  // take if abort itself fails.
+  pub let TXN_BEGIN_FAIL_MSG : [u8; 29] =
+    "cp: transaction begin failed\n"
+  pub let TXN_BEGIN_FAIL_MSG_LEN : u64 = 29
+
+  pub let TXN_COMMIT_FAIL_MSG : [u8; 30] =
+    "cp: transaction commit failed\n"
+  pub let TXN_COMMIT_FAIL_MSG_LEN : u64 = 30
+
   // -- Dispatch state ---------------------------------------------------
   // Records which arm fired; useful at M3 for the audit-first journal
   // record that has to name the operation before any output.
@@ -125,54 +146,68 @@ module Dispatch = structure {
   // Signature: dispatch_copy : () -> u64 !{mem, sysreg} @{}
   // RAX (output): exit code (0..4)
   //
-  // Flow (M2):
+  // Flow (M2 including M2-004 TXN hoist):
   //   Step 1: CpFlags::flags_reset + CpFlags::populate — mirror the
   //           four cp flag IDs into the CpFlags .bss slots.
-  //   Step 2: check pos_count == 2. If not, jump to USAGE arm.
-  //   Step 3: check CpFlags::flag_recursive_seen. If set, load
-  //           pos_ptrs[0]/pos_ptrs[1] into rdi/rsi and call
-  //           Walk::walk_recursive; adopt its return as our exit code.
-  //   Step 4: otherwise (single-file path), load pos_ptrs[0]/pos_ptrs[1]
-  //           into rdi/rsi and call CopyFile::copy_single_file; adopt
-  //           its return as our exit code.
+  //   Step 2: check pos_count == 2. If not, jump to USAGE arm (no TXN
+  //           opened; usage error is a pre-TXN condition).
+  //   Step 3: pdxfs_txn_begin — open the outer per-invocation TXN.
+  //           On failure jump to TXN-begin-fail arm.
+  //   Step 4: check CpFlags::flag_recursive_seen. Route to
+  //           Walk::walk_recursive (recursive) or CopyFile::copy_bytes_only
+  //           (single-file). Both run inside the outer TXN. Save the
+  //           body's exit code in rbx.
+  //   Step 5: if body-exit != 0, pdxfs_txn_abort (silent) and return
+  //           the body's exit code. Otherwise pdxfs_txn_commit; on
+  //           commit-fail print + return 1; on commit success return 0.
   //
-  // Prologue: 1 push (rbx). rsp%16 was 8 on entry (SysV call), one
-  // push brings it to 0 for the nested Print::print_err /
-  // CopyFile::copy_single_file / Walk::walk_recursive calls. rbx unused
-  // body-side at M2 but preserved for the M3+ shape that will hold the
-  // outer TXN handle across the copy dispatch (per cp.M2-004's TXN
-  // wrap at dispatch level).
-  //
-  // Register plan (M2):
-  //   rbx = unused; preserved for M2-004's TXN-handle shape
+  // Register plan (2-push prologue → rsp%16 == 0 at every nested call):
+  //   rbx = body exit code (survives txn_commit / txn_abort call)
+  //   r12 = pushed for parity + reserved for M3's audit_id handle
   //   rax = call return / temp
   //   rdi, rsi = nested-call arg carriers
   //   r11 = lea scratch (every .bss / .rodata address)
+  //
+  // rsp arithmetic:
+  //   caller-of-dispatch_copy: rsp%16 == 0 immediately before call
+  //   after CALL:              rsp%16 == 8
+  //   after push rbx:          rsp%16 == 0
+  //   after push r12:          rsp%16 == 8
+  //   after sub rsp, 8:        rsp%16 == 0  ← every nested call ok
+  //   epilogue reverses.
   // ============================================================================
   pub let dispatch_copy : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M1-002 dispatch_copy body + cp.M1-003 happy-arm wire + cp.M2-001 typed flags + recursive route. Migrates from M1's byte-compare walk over ParsedArgs::flag_names to M2's mirror-driven check via CpFlags::flag_recursive_seen. Flow: CpFlags::flags_reset → CpFlags::populate → check pos_count == 2 → check flag_recursive_seen → route to Walk::walk_recursive (recursive) or CopyFile::copy_single_file (single). 1-push prologue (rbx) aligns rsp%16 to 0 for every nested call. rbx unused body-side; reserved for M2-004's TXN-handle shape that will wrap this dispatch under a single per-invocation transaction. Every fail arm structure is print+pop+exit-code+ret so rax carries the exit code out cleanly; every happy arm is pos_ptrs-load+call+pop+ret so the copy/walk exit code passes through untouched. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (largest: 2 for pos_count, 4 for ARM_RECURSIVE_WALK).",
+      justification: "cp.M2-001 typed flags + cp.M2-004 single-TXN hoist. Migrates the M1 byte-compare walk to CpFlags mirror check and hoists the KIND_PDXFS_TXN wrap from copy_single_file to dispatch level so a SINGLE outer TXN spans the whole invocation (single-file or recursive) — per plan §5.6 M2 line `single-TXN atomicity across whole invocation (partial rollback)`. Flow: reset+populate CpFlags → pos_count gate (usage-error exits pre-TXN) → pdxfs_txn_begin → route to Walk::walk_recursive or CopyFile::copy_bytes_only (body exit saved in rbx) → on body fail call pdxfs_txn_abort (silent, unwind partial writes) and return body exit → on body ok call pdxfs_txn_commit → return 0 on commit-ok, 1 with diagnostic on commit-fail. 2-push prologue (rbx=body_exit, r12=reserved for M3 audit_id) + `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call site (7 call sites: flags_reset, populate, print_err, txn_begin, walk_recursive/copy_bytes_only, txn_abort, txn_commit). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (largest: 2 for pos_count, 4 for ARM_RECURSIVE_WALK). Negative-errno detection on TXN returns uses cmp rax,0; jl (signed compare).",
       block: {
-        push rbx;
+        // ---- Prologue -------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
 
         // ---- Step 1: mirror the four cp flag IDs ---------------------------
         call CpFlags::flags_reset;
         call CpFlags::populate;
 
-        // ---- Step 2: pos_count == 2 check ----------------------------------
+        // ---- Step 2: pos_count == 2 check (pre-TXN) ------------------------
         lea r11, [rip + ParsedArgs::pos_count];
         mov rax, [r11];
         cmp rax, 2;
         jne dispatch_usage_error;
 
-        // ---- Step 3: recursive flag check ----------------------------------
+        // ---- Step 3: open outer TXN ----------------------------------------
+        call Pdxfs::pdxfs_txn_begin;
+        cmp rax, 0;
+        jl dispatch_txn_begin_fail;
+
+        // ---- Step 4: recursive-vs-single route (both under the TXN) --------
         lea r11, [rip + CpFlags::flag_recursive_seen];
         mov rax, [r11];
         cmp rax, 0;
         je dispatch_single_file;
 
-        // Recursive arm: walk_recursive(pos_ptrs[0], pos_ptrs[1]).
+        // Recursive arm.
         mov rax, 4;                            // ARM_RECURSIVE_WALK
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
@@ -181,12 +216,9 @@ module Dispatch = structure {
         mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
         mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
         call Walk::walk_recursive;
-        // rax now carries Walk::walk_recursive's exit code (0 or 1).
+        mov rbx, rax;                          // rbx = body exit code
+        jmp dispatch_body_return;
 
-        pop rbx;
-        ret
-
-        // ---- Step 4: single-file arm ---------------------------------------
       dispatch_single_file:
         mov rax, 1;                            // ARM_SINGLE_FILE
         lea r11, [rip + chosen_arm];
@@ -195,11 +227,45 @@ module Dispatch = structure {
         lea r11, [rip + ParsedArgs::pos_ptrs];
         mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
         mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
-        call CopyFile::copy_single_file;
-        // rax now carries CopyFile's exit code (0 or 1).
+        call CopyFile::copy_bytes_only;
+        mov rbx, rax;                          // rbx = body exit code
 
-        pop rbx;
-        ret
+        // ---- Step 5: commit or abort based on body exit --------------------
+      dispatch_body_return:
+        cmp rbx, 0;
+        jne dispatch_body_fail_abort;
+
+        // Body succeeded — commit the TXN.
+        call Pdxfs::pdxfs_txn_commit;
+        cmp rax, 0;
+        jl dispatch_txn_commit_fail;
+
+        // Success. rbx still 0.
+        mov rax, rbx;                          // rax = 0
+        jmp dispatch_epilogue;
+
+      dispatch_body_fail_abort:
+        // Body failed. Abort the TXN (silent; return ignored) and
+        // propagate the body's exit code as our exit code.
+        call Pdxfs::pdxfs_txn_abort;
+        mov rax, rbx;                          // preserve body exit
+        jmp dispatch_epilogue;
+
+      dispatch_txn_begin_fail:
+        lea rdi, [rip + TXN_BEGIN_FAIL_MSG];
+        mov rsi, 29;                           // TXN_BEGIN_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;                            // EXIT_OP_FAIL
+        jmp dispatch_epilogue;
+
+      dispatch_txn_commit_fail:
+        // Commit failed. Best-effort abort (silent) and return 1.
+        call Pdxfs::pdxfs_txn_abort;
+        lea rdi, [rip + TXN_COMMIT_FAIL_MSG];
+        mov rsi, 30;                           // TXN_COMMIT_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;                            // EXIT_OP_FAIL
+        jmp dispatch_epilogue;
 
       dispatch_usage_error:
         mov rax, 2;                            // ARM_USAGE
@@ -210,8 +276,13 @@ module Dispatch = structure {
         mov rsi, 60;                           // USAGE_MSG_LEN
         call Print::print_err;
 
-        pop rbx;
         mov rax, 2;                            // EXIT_USAGE
+        jmp dispatch_epilogue;
+
+      dispatch_epilogue:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
         ret
       }
     }

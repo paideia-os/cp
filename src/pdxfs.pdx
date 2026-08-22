@@ -267,6 +267,44 @@ module Pdxfs = structure {
     }
 
   // ============================================================================
+  // pdxfs_txn_abort() -> 0 (M2 STUB)
+  //
+  // Signature: pdxfs_txn_abort : () -> u64 !{mem} @{}
+  // RAX (output): PDXFS_TXN_OK (0)
+  //
+  // M2 STUB. Rolls back the outer KIND_PDXFS_TXN opened by
+  // pdxfs_txn_begin. cp.M2-004 wraps every invocation (single-file or
+  // recursive) in one TXN at dispatch level; any failure inside the
+  // copy/walk body calls this entry before returning so partial writes
+  // to the destination are unwound at the TXN boundary.
+  //
+  // Symmetric to pdxfs_txn_begin / pdxfs_txn_commit: all three ship as
+  // stubs today because the paideia-os R42 substrate at HEAD landed
+  // KIND_PDXFS_TXN as derived-kind + witness only; the corresponding
+  // syscalls are not yet exposed. When the substrate lands, all three
+  // bodies flip in place — the abort entry becomes
+  // `mov rax, N_TXN_ABORT; syscall; ret`.
+  //
+  // The abort return is currently ignored by dispatch — a failed abort
+  // is a driver-level anomaly out of cp's control (the txn handle
+  // becomes stale either way). Returning 0 today keeps the callsite
+  // structure simple; when the real body starts returning negative
+  // errno on abort failure, dispatch may add a "double-fail" diagnostic
+  // path.
+  //
+  // Leaf; r11 scratch; no state written.
+  // ============================================================================
+  pub let pdxfs_txn_abort : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-004 pdxfs_txn_abort M2 STUB. Always returns 0. Third of the KIND_PDXFS_TXN stub trio (begin/commit/abort); all three flip to real sys_pdxfs_txn_* syscalls at R42 substrate expansion. cp.M2-004 opens the outer TXN at dispatch level (dispatch.pdx) and closes it with commit on success or abort on body failure — abort_txn is the on-error path that unwinds partial destination writes at the TXN boundary. xor rax,rax is one byte cheaper than mov rax,0 and produces the same result. Leaf; r11 scratch.",
+      block: {
+        xor rax, rax;                          // PDXFS_TXN_OK (0)
+        ret
+      }
+    }
+
+  // ============================================================================
   // pdxfs_readdir(fd, buf_ptr, len) -> bytes_or_errno (M2 STUB)
   //
   // Signature: pdxfs_readdir : (u64, u64, u64) -> u64 !{mem} @{}
