@@ -1,4 +1,4 @@
-// src/signed_inode.pdx — cp.M2-002
+// src/signed_inode.pdx — cp.M2-002 + cp.M2-003 (verbose degrade diagnostic)
 // SignedInode module: cap-tail preservation at the destination inode.
 //
 // Scope
@@ -20,8 +20,27 @@
 // per plan §5.6. Until then this file stubs the re-sign body: every
 // call returns SI_DEGRADED_KEY_LOCKED (the "invoker's passphrase is
 // not currently unlocked" leaf of the decision tree), which the
-// caller either ignores (M2-002) or emits a `--verbose` diagnostic
-// for (M2-003 body-edit in this same module).
+// caller either ignores or (M2-003) sees emit a `--verbose`
+// diagnostic on stderr describing that the destination cap-tail is
+// unsigned.
+//
+// M2-003 verbose diagnostic
+// -------------------------
+// When CpFlags::flag_verbose_seen != 0 (either `-v` or `--verbose`
+// was on the command line, tracked by the CpFlags mirror per
+// M2-001), the degrade path prints a one-line diagnostic on stderr
+// naming the destination path before returning SI_DEGRADED_KEY_LOCKED.
+// The diagnostic gives the invoker visibility into a copy that
+// completed successfully at the byte level but does not carry an
+// updated cap-tail — a signal that the destination inode's
+// authorship attribution now diverges from PdxFS v1's signed
+// inode expectation.
+//
+// When verbose is NOT set, the degrade path stays silent (the byte
+// content copy is authoritative for `cp` semantics; the missing
+// signature is a background-only concern for most invocations).
+// This matches design/user/model.md §10.2's "silent-by-default,
+// visible-on-request" discipline for auth-tail preservation events.
 //
 // The M2-002 stub is deliberately loud in the design/architecture
 // note but silent at runtime — a downstream test asserting "cp
@@ -72,9 +91,11 @@
 //     0xFFFFFFFF for SI_ERROR is loaded via mov reg, imm not compared).
 //   - r11 is scratch (used only for the .bss slot lea in the counter
 //     bump).
-//   - preserve_at_destination is a leaf at M2 stub (no calls); when
-//     libpdx-cap.M3 lands it becomes non-leaf and gains a 1-push
-//     prologue then.
+//   - preserve_at_destination becomes NON-LEAF at M2-003 (calls
+//     Print::print_err on the verbose-degrade path). 1-push prologue
+//     (rbx = dst_ptr, preserved across the print call so the ret is
+//     unaffected by the syscall clobber shape) keeps rsp%16 == 0 for
+//     the nested call.
 
 module SignedInode = structure {
 
@@ -88,6 +109,14 @@ module SignedInode = structure {
   // -- helper N times for N-file cp -r". Zero'd by signed_inode_reset.
   pub let mut preserve_calls    : u64 = uninit @align(8)
   pub let mut preserve_degrades : u64 = uninit @align(8)
+
+  // -- Verbose-degrade diagnostic. Emitted on stderr when the
+  // -- SI_DEGRADED_KEY_LOCKED return path fires AND CpFlags
+  // -- ::flag_verbose_seen != 0. See file header §"M2-003 verbose
+  // -- diagnostic" for the rationale.
+  pub let SI_DEGRADE_MSG : [u8; 46] =
+    "cp: destination cap-tail unsigned (key locked)\n"
+  pub let SI_DEGRADE_MSG_LEN : u64 = 46
 
   // ============================================================================
   // signed_inode_reset()
@@ -143,11 +172,14 @@ module SignedInode = structure {
   //
   // Leaf at M2 (no calls); r11 scratch; no push/pop parity.
   // ============================================================================
-  pub let preserve_at_destination : (u64) -> u64 !{mem} @{} =
+  pub let preserve_at_destination : (u64) -> u64 !{mem, sysreg} @{} =
     fn (dst_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "cp.M2-002 SignedInode::preserve_at_destination M2 STUB. Bumps preserve_calls (indicates the preservation helper was invoked) then bumps preserve_degrades and returns SI_DEGRADED_KEY_LOCKED (invoker's user_sk sealed / libpdx-cap.M3 not landed). The dst_ptr argument is informational — the real body (post libpdx-cap.M3) will pass it to cap_sign_inode(dst_ptr, invoker_user_sk); reading it here would be work without semantic effect. Leaf; r11 scratch for the two counter bumps (three-instruction read-modify-write per counter with r11 as .bss address holder). paideia-as compliance: no test, no large immediates, xor rax,rax for zero, mov rax, 1 for the SI_DEGRADED_KEY_LOCKED constant. When libpdx-cap.M3 lands, this body edits to call cap_sign_inode and only returns SI_DEGRADED_KEY_LOCKED when the key-lock check reports unlocked; every caller keeps its shape.",
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M2-002 + cp.M2-003 SignedInode::preserve_at_destination. Bumps preserve_calls, then (M2 stub) unconditionally falls into the degrade branch: bumps preserve_degrades, gates on CpFlags::flag_verbose_seen for the M2-003 diagnostic emit, returns SI_DEGRADED_KEY_LOCKED. Non-leaf at M2-003: the Print::print_err call on the verbose-set path requires a 1-push prologue (rbx = unused; pushed to keep rsp%16 == 0 for the nested call). When CpFlags::flag_verbose_seen == 0 the print branch is skipped; the function still calls into the prologue/epilogue push/pop pair which is the cost of the M2-003 shape (no test-based short-circuit). paideia-as compliance: r11 is scratch for every .bss lea; cmp reg,imm uses immediates ≤ 0x7FFFFFFF (largest 46 for SI_DEGRADE_MSG_LEN); no test mnemonic; SI_ERROR (0xFFFFFFFF) not returned by the M2 stub so no large-imm stage needed here. When libpdx-cap.M3 lands, the body edits to call cap_sign_inode BEFORE the degrade branch and only falls through on key-locked; the verbose branch and prologue/epilogue shape stay unchanged.",
       block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+
         // Bump preserve_calls: [preserve_calls] += 1.
         lea r11, [rip + preserve_calls];
         mov rax, [r11];
@@ -163,8 +195,23 @@ module SignedInode = structure {
         add rax, 1;
         mov [r11], rax;
 
+        // ---- M2-003 verbose degrade diagnostic ------------------------------
+        // Emit SI_DEGRADE_MSG on stderr iff CpFlags::flag_verbose_seen
+        // is set. Silent-by-default: cp does not warn on cap-tail
+        // degrade unless the invoker asked for verbose output.
+        lea r11, [rip + CpFlags::flag_verbose_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        je si_pad_return;
+
+        lea rdi, [rip + SI_DEGRADE_MSG];
+        mov rsi, 46;                           // SI_DEGRADE_MSG_LEN
+        call Print::print_err;
+
+      si_pad_return:
         // Return SI_DEGRADED_KEY_LOCKED.
         mov rax, 1;                            // SI_DEGRADED_KEY_LOCKED
+        pop rbx;
         ret
       }
     }
