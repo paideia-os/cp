@@ -1,19 +1,33 @@
-// src/pdxfs.pdx — cp.M1-003
+// src/pdxfs.pdx — cp.M1-003 + cp.M2-001 (readdir/mkdir stubs)
 // Pdxfs module: syscall trampolines for open/read/write/close +
-// stub trampolines for KIND_PDXFS_TXN begin/commit.
+// stub trampolines for KIND_PDXFS_TXN begin/commit +
+// M2 stubs for readdir/mkdir (walk substrate) that will flip to real
+// syscalls when the R42 substrate expansion exposes them.
 //
 // Scope
 // -----
-// M1 wraps five paideia-os syscalls behind named entry points so
-// CopyFile::copy_single_file does not have to open-code the
-// SysV → SYSCALL argument marshalling at every call site:
+// M1 wrapped five paideia-os syscalls behind named entry points so
+// CopyFile::copy_single_file did not have to open-code the SysV →
+// SYSCALL argument marshalling at every call site. M2 adds two more:
 //
 //   pdxfs_open(path_ptr, flags)     → fd or negative errno   [sysno 2]
 //   pdxfs_read(fd, buf, len)        → n or negative errno    [sysno 0]
 //   pdxfs_write(fd, buf, len)       → n or negative errno    [sysno 1]
 //   pdxfs_close(fd)                 → 0 or negative errno    [sysno 3]
-//   pdxfs_txn_begin()               → 0 (M1 stub; real at M2)
-//   pdxfs_txn_commit()              → 0 (M1 stub; real at M2)
+//   pdxfs_txn_begin()               → 0 (M1 stub; real at R42)
+//   pdxfs_txn_commit()              → 0 (M1 stub; real at R42)
+//   pdxfs_readdir(fd, buf, len)     → 0 (M2 stub; real at R42)  NEW
+//   pdxfs_mkdir(path_ptr, mode)     → 0 (M2 stub; real at R42)  NEW
+//
+// The two M2 stubs return 0 unconditionally so the walk shape in
+// src/walk.pdx compiles and runs cleanly today: pdxfs_mkdir "succeeds"
+// (nothing to create in the smoke matrix; walk_recursive treats 0 as
+// created), pdxfs_readdir returns 0 = EOF (empty directory) so the
+// readdir loop exits immediately without touching the per-entry work.
+// When the substrate lands both bodies flip in place with no
+// restructure of walk.pdx — same discipline as M1's txn_begin /
+// txn_commit stubs (see the corresponding notes on those two entry
+// points below).
 //
 // The open/read/write/close arity is ≤ 3, so no SysV → SYSCALL r10
 // shuffle is needed (matches the arity-0..3 template in paideia-os's
@@ -248,6 +262,81 @@ module Pdxfs = structure {
       justification: "cp.M1-003 pdxfs_txn_commit M1 STUB. Always returns 0. Symmetric to pdxfs_txn_begin: M2 issues sys_pdxfs_txn_commit against the txn handle stashed by the begin path. Both bodies land at M2; every M1 call site (currently just CopyFile::copy_single_file) keeps its shape unchanged. Leaf.",
       block: {
         xor rax, rax;                          // PDXFS_TXN_OK (0)
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_readdir(fd, buf_ptr, len) -> bytes_or_errno (M2 STUB)
+  //
+  // Signature: pdxfs_readdir : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): fd       — directory file descriptor in [3, 32)
+  // RSI (input): buf_ptr  — destination buffer VA (dirent records)
+  // RDX (input): len      — buffer capacity in bytes
+  // RAX (output): 0 (M2 STUB = "no entries / EOF"). Real body returns
+  //               bytes-of-dirent-records emitted into buf on success,
+  //               0 at end of directory, or a negative errno.
+  //
+  // M2 STUB. The paideia-os R42 substrate at HEAD (2026-08-21) exposes
+  // KIND_PDXFS_FILE + KIND_PDXFS_TXN as derived kinds + witnesses; the
+  // sys_pdxfs_readdir dispatch entry lands at the R42 substrate
+  // expansion (blocked with the txn syscall pair per M1's STATUS.md).
+  //
+  // Returning 0 unconditionally is deliberate: Walk::walk_recursive
+  // treats 0 as "no more entries in this directory" and exits its
+  // readdir loop cleanly. That lets the walk shape (mkdir dst; open
+  // src as dir; readdir loop; close) run today over any src directory
+  // as a zero-entry no-op, and start doing real per-entry work at M2's
+  // R42 body-edit without any restructure of walk.pdx.
+  //
+  // At M3 the M4 dirent-parsing addition to walk.pdx will start
+  // reading buf as an array of dirent records once the real body
+  // populates it. The dirent format the substrate will publish is
+  // TBD (softarch Round 3 open question); this stub reserves the
+  // signature shape so the walker call site is stable.
+  //
+  // Leaf; r11 scratch; no state written.
+  // ============================================================================
+  pub let pdxfs_readdir : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fd: u64) (buf_ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-001 pdxfs_readdir M2 STUB. Always returns 0 (EOF), which Walk::walk_recursive treats as `directory exhausted, exit loop cleanly`. The paideia-os R42 substrate has landed KIND_PDXFS_FILE + KIND_PDXFS_TXN (derived-kind + witness) but not the sys_pdxfs_readdir dispatch entry; that syscall + this body flip together at R42 expansion (same pattern as the M1 txn_begin/txn_commit stubs). Signature matches sys_read's shape (fd, buf, len) so the M2→R42 body-edit is a straight substitution: `mov rax, N_READDIR; syscall; ret`. Arity 3 requires no r10 shuffle. Leaf; no callee-save touched.",
+      block: {
+        xor rax, rax;                          // 0 = EOF (M2 stub)
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_mkdir(path_ptr, mode) -> 0_or_errno (M2 STUB)
+  //
+  // Signature: pdxfs_mkdir : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): path_ptr — VA of a NUL-terminated destination path
+  // RSI (input): mode     — permission bits (typically 0o755 = 0x1ED)
+  // RAX (output): 0 (M2 STUB = "created / already exists"). Real body
+  //               returns 0 on success, negative errno on failure
+  //               (SYS_MKDIR_ERR_EEXIST = -17 if the target already
+  //               exists as a directory — cp treats that as success
+  //               under `-r` when the dst tree is being merged).
+  //
+  // M2 STUB. Same substrate-blocking reason as pdxfs_readdir. Returns
+  // 0 so Walk::walk_recursive's `pdxfs_mkdir(dst) → check negative
+  // errno` gate falls through into the readdir loop on every call.
+  //
+  // When the substrate lands: at that point the caller's `mode` byte
+  // is honoured (assuming the vfs layer starts consulting it — same
+  // caveat as sys_open's ignored-mode-at-M1). Until then, cp defaults
+  // to 0o755 for user-writable directory trees; a future --preserve-
+  // mode flag can override via a signature edit.
+  //
+  // Leaf; r11 scratch; no state written.
+  // ============================================================================
+  pub let pdxfs_mkdir : (u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (mode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-001 pdxfs_mkdir M2 STUB. Always returns 0 (success), which Walk::walk_recursive treats as `destination dir created (or already existed under -r merge semantics), continue into readdir loop`. R42 substrate expansion supplies the real sys_mkdir dispatch entry; this body flips to `mov rax, N_MKDIR; syscall; ret` at that point. Arity 2 requires no r10 shuffle. Leaf; no callee-save touched.",
+      block: {
+        xor rax, rax;                          // 0 = success (M2 stub)
         ret
       }
     }

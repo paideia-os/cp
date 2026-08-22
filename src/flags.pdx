@@ -1,0 +1,326 @@
+// src/flags.pdx — cp.M2-001
+// CpFlags module: cp-specific flag registration + parsed-args mirror.
+//
+// Scope
+// -----
+// M2 migrates cp from the M1 byte-compare flag walk (dispatch.pdx
+// scanning `ParsedArgs::flag_names[]` for `'r'\0`) to libpdx-argv's
+// typed-flag registration path. The four cp-specific flags are:
+//
+//   -r                 short bool  id 100  CP_ID_RECURSIVE
+//   -v                 short bool  id 101  CP_ID_VERBOSE   (short alias
+//                                          for --verbose from StdVocab)
+//   --over-existing    long  bool  id 102  CP_ID_OVER_EXISTING
+//   --dry-run          long  bool  --      handled via StdVocab id 3
+//
+// StdVocab (libpdx-argv M2-002) already registers `--help`, `--version`,
+// `--dry-run`, `--json`, `--schema`, `--verbose`, `--quiet`, `--color`,
+// `--no-cap`. cp's `--dry-run` reuses `StdVocab::STD_ID_DRY_RUN = 3` and
+// `--verbose` reuses `STD_ID_VERBOSE = 6`. The short `-v` and short `-r`
+// aliases + the cp-owned `--over-existing` land here.
+//
+// After Parser::parse_argv, dispatch.pdx populates the four mirror
+// .bss slots below via CpFlags::populate. Every downstream reader
+// (Walk::walk_recursive, CopyFile::copy_single_file, SignedInode::*,
+// Undo::*) loads from these slots rather than re-calling
+// ParsedArgs::find_flag_by_id — the mirror is a single choke point
+// so per-flag semantics live in one file.
+//
+// Slot values
+// -----------
+// Each `flag_*` slot is 0 if the flag was not seen, or the ParsedArgs
+// storage index k in [0..flag_count) if it was. Consumers gate on
+// `cmp [slot], 0; je not_seen` (present-vs-absent is what most call
+// sites need). A future M3 addition can extend the mirror with a
+// value pointer for typed flags; today all four are booleans.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module CpFlags (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest immediate here is 102
+//     for CP_ID_OVER_EXISTING, and 32 for MAX_FLAGS sentinel from
+//     libpdx-argv).
+//   - r11 is scratch (every lea for .bss slot addresses).
+//   - flags_reset is leaf; register_cp_flags is non-leaf (3 calls into
+//     FlagSpec::register); populate is non-leaf (4 calls into
+//     ParsedArgs::find_flag_by_id).
+//   - populate uses a 1-push prologue (rbx unused body-side; pushed
+//     purely to keep rsp%16 == 0 for the nested calls). Same shape as
+//     StdVocab::register_all in libpdx-argv.
+
+module CpFlags = structure {
+
+  // -- Numeric IDs. Tool-specific IDs must start at 100 per the
+  // -- convention documented in libpdx-argv StdVocab.pdx (IDs 1..9
+  // -- reserved for the I3 standard vocabulary; 10..99 reserved for
+  // -- future StdVocab extensions).
+  pub let CP_ID_RECURSIVE     : u64 = 100
+  pub let CP_ID_VERBOSE       : u64 = 101
+  pub let CP_ID_OVER_EXISTING : u64 = 102
+
+  // -- Flag names as NUL-terminated .rodata literals. FlagSpec::lookup
+  // -- does an inline strcmp against these pointers during parse.
+  pub let CP_NAME_RECURSIVE     : [u8; 2]  = "r\0"
+  pub let CP_NAME_VERBOSE_SHORT : [u8; 2]  = "v\0"
+  pub let CP_NAME_OVER_EXISTING : [u8; 14] = "over-existing\0"
+
+  // -- Mirror slots. Populated by CpFlags::populate after parse. Value
+  // -- is 0 (not seen) or the ParsedArgs storage index k in
+  // -- [0..flag_count) if the flag was on the command line.
+  //
+  // Because index 0 IS a valid ParsedArgs slot, "not seen" is
+  // distinguished from "seen at slot 0" via a second mirror bit —
+  // flag_*_seen — that populate sets to 1 iff the flag was found.
+  // Consumers gate on `cmp [flag_*_seen], 0` for presence and read
+  // `[flag_*]` only when they need to reach into ParsedArgs (e.g. to
+  // fetch a value pointer once typed flags land at M3).
+  pub let mut flag_recursive          : u64 = uninit @align(8)
+  pub let mut flag_verbose            : u64 = uninit @align(8)
+  pub let mut flag_dry_run            : u64 = uninit @align(8)
+  pub let mut flag_over_existing      : u64 = uninit @align(8)
+
+  pub let mut flag_recursive_seen     : u64 = uninit @align(8)
+  pub let mut flag_verbose_seen       : u64 = uninit @align(8)
+  pub let mut flag_dry_run_seen       : u64 = uninit @align(8)
+  pub let mut flag_over_existing_seen : u64 = uninit @align(8)
+
+  // ============================================================================
+  // flags_reset()
+  //
+  // Signature: flags_reset : () -> () !{mem} @{}
+  //
+  // Zero all eight mirror slots so a subsequent populate starts from a
+  // known baseline. Called by dispatch_copy at the top of the flag-gate
+  // pass; mirrors ParsedArgs::reset / FlagSpec::reset shape.
+  //
+  // Leaf; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let flags_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-001 CpFlags::flags_reset. Zero the eight mirror slots (four flag_* + four flag_*_seen) so populate starts from a known-empty state. xor rax,rax produces the zero written to each slot; r11 is scratch for every lea. Leaf.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + flag_recursive];          mov [r11], rax;
+        lea r11, [rip + flag_verbose];            mov [r11], rax;
+        lea r11, [rip + flag_dry_run];            mov [r11], rax;
+        lea r11, [rip + flag_over_existing];      mov [r11], rax;
+        lea r11, [rip + flag_recursive_seen];     mov [r11], rax;
+        lea r11, [rip + flag_verbose_seen];       mov [r11], rax;
+        lea r11, [rip + flag_dry_run_seen];       mov [r11], rax;
+        lea r11, [rip + flag_over_existing_seen]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // register_cp_flags()
+  //
+  // Signature: register_cp_flags : () -> () !{mem} @{}
+  //
+  // Registers the three cp-owned flag names with FlagSpec. Must be
+  // called AFTER FlagSpec::reset (and typically AFTER
+  // StdVocab::register_all — the ordering is not important for
+  // correctness because FlagSpec::lookup does an unordered scan, but
+  // registering StdVocab first keeps id 1..9 dense at the head of the
+  // spec table).
+  //
+  // Non-leaf: three FlagSpec::register calls. 1-push prologue (rbx
+  // unused body-side; pushed to align rsp%16 to 0 for the nested
+  // calls). Same shape as StdVocab::register_all in libpdx-argv.
+  //
+  // Register plan:
+  //   rdi = name_ptr per call
+  //   rsi = FKIND_BOOL (0)
+  //   rdx = numeric id
+  //   rbx = pushed for alignment; not read body-side
+  // ============================================================================
+  pub let register_cp_flags : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-001 CpFlags::register_cp_flags. Registers `r` (short -r, id 100), `v` (short -v, id 101), and `over-existing` (long, id 102) with FlagSpec. All three are FKIND_BOOL (rsi=0). Non-leaf: 1-push prologue (rbx, unused, for rsp alignment) → rsp%16: 8 → 0 for the nested FlagSpec::register calls. Same shape as StdVocab::register_all. StdVocab::register_all is expected to run before this call so the standard vocabulary (id 1..9 including --dry-run and --verbose) is already registered; register_cp_flags adds the three tool-specific entries at spec_count 9..11. cp does NOT register `dry-run` or `verbose` long here — those are covered by StdVocab; only the short-form aliases + `--over-existing` are cp-owned.",
+      block: {
+        push rbx;                                // align rsp%16 to 0
+
+        lea rdi, [rip + CP_NAME_RECURSIVE];     mov rsi, 0;    mov rdx, 100;
+        call FlagSpec::register;
+
+        lea rdi, [rip + CP_NAME_VERBOSE_SHORT]; mov rsi, 0;    mov rdx, 101;
+        call FlagSpec::register;
+
+        lea rdi, [rip + CP_NAME_OVER_EXISTING]; mov rsi, 0;    mov rdx, 102;
+        call FlagSpec::register;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // populate()
+  //
+  // Signature: populate : () -> () !{mem, sysreg} @{}
+  //
+  // After Parser::parse_argv has populated ParsedArgs, walk the four
+  // id numbers we care about and mirror the storage index into the
+  // corresponding flag_* slot. For each: if find_flag_by_id returns
+  // MAX_FLAGS (=32), the flag was not seen — write 0 to flag_* and 0
+  // to flag_*_seen. Otherwise write the returned index to flag_* and
+  // 1 to flag_*_seen.
+  //
+  // The four IDs queried:
+  //   CP_ID_RECURSIVE       (100)  → flag_recursive
+  //   CP_ID_VERBOSE         (101)  → flag_verbose (short -v)
+  //   StdVocab::STD_ID_VERBOSE = 6 also folds into flag_verbose
+  //     (either short -v or long --verbose sets the mirror seen bit)
+  //   StdVocab::STD_ID_DRY_RUN = 3 → flag_dry_run
+  //   CP_ID_OVER_EXISTING   (102) → flag_over_existing
+  //
+  // The verbose fold-in: two find_flag_by_id calls (id 6 and id 101),
+  // OR the two seen bits into flag_verbose_seen so `cp -v` and
+  // `cp --verbose` are indistinguishable at the mirror level. The
+  // flag_verbose slot holds whichever k was found first (short takes
+  // priority if both were passed — but that is a pathological argv
+  // form no cp caller emits).
+  //
+  // Non-leaf: 4 ParsedArgs::find_flag_by_id calls (for the four id
+  // lookups). 2-push prologue (rbx, r12) + `sub rsp, 8` pad brings
+  // rsp%16 to 0 at each nested call site. rbx holds the current
+  // find_flag_by_id return across the "did we find it" cmp+jump so
+  // r11 stays free for the .bss lea. r12 unused body-side; pushed to
+  // keep the pad-plus-two-pushes shape identical to cp_main.
+  //
+  // Register plan:
+  //   rbx = find_flag_by_id return value (survives per-call)
+  //   r12 = unused (pushed for alignment)
+  //   rax = scratch
+  //   rdi = target id per call
+  //   r11 = lea scratch for every .bss slot
+  // ============================================================================
+  pub let populate : () -> () !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M2-001 CpFlags::populate. Mirror the four cp-relevant flag IDs from ParsedArgs into the eight flag_*/flag_*_seen slots. Each mirror = one find_flag_by_id call whose return is compared against 32 (MAX_FLAGS sentinel from libpdx-argv parsed_args.pdx). Non-leaf: 2-push prologue (rbx, r12) + `sub rsp, 8` pad keeps rsp%16 == 0 across every nested find_flag_by_id call. The verbose fold-in queries both id 6 (StdVocab STD_ID_VERBOSE = --verbose) and id 101 (CP_ID_VERBOSE = -v) and ORs the seen bits into flag_verbose_seen so a downstream `cmp [flag_verbose_seen], 0` fires for either surface form. Register plan uses rbx for the find_flag_by_id return (survives cmp+jump) and r11 exclusively for .bss address computation, per paideia-as compliance. sysreg effect declared because ParsedArgs::find_flag_by_id declares !{mem} — future effect-inference tightens this — and this callee's effect envelope adopts the union.",
+      block: {
+        // ---- Prologue -------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // ---- CP_ID_RECURSIVE (id 100) --------------------------------------
+        mov rdi, 100;
+        call ParsedArgs::find_flag_by_id;
+        mov rbx, rax;                          // rbx = k
+        cmp rbx, 32;                           // MAX_FLAGS sentinel
+        jge cpf_pop_recursive_absent;
+
+        // Present. flag_recursive = k; flag_recursive_seen = 1.
+        lea r11, [rip + flag_recursive];
+        mov [r11], rbx;
+        mov rax, 1;
+        lea r11, [rip + flag_recursive_seen];
+        mov [r11], rax;
+        jmp cpf_pop_verbose_short;
+
+      cpf_pop_recursive_absent:
+        xor rax, rax;
+        lea r11, [rip + flag_recursive];        mov [r11], rax;
+        lea r11, [rip + flag_recursive_seen];   mov [r11], rax;
+
+        // ---- CP_ID_VERBOSE short (id 101) ----------------------------------
+      cpf_pop_verbose_short:
+        mov rdi, 101;
+        call ParsedArgs::find_flag_by_id;
+        mov rbx, rax;
+        cmp rbx, 32;
+        jge cpf_pop_verbose_short_absent;
+
+        // Present. Set flag_verbose to k (short takes priority in the
+        // slot; the seen bit lands OR-wise in flag_verbose_seen).
+        lea r11, [rip + flag_verbose];
+        mov [r11], rbx;
+        mov rax, 1;
+        lea r11, [rip + flag_verbose_seen];
+        mov [r11], rax;
+        jmp cpf_pop_verbose_long;
+
+      cpf_pop_verbose_short_absent:
+        xor rax, rax;
+        lea r11, [rip + flag_verbose];         mov [r11], rax;
+        lea r11, [rip + flag_verbose_seen];    mov [r11], rax;
+
+        // ---- STD_ID_VERBOSE long (id 6) — folds into flag_verbose ----------
+      cpf_pop_verbose_long:
+        mov rdi, 6;
+        call ParsedArgs::find_flag_by_id;
+        mov rbx, rax;
+        cmp rbx, 32;
+        jge cpf_pop_dry_run;
+
+        // --verbose present. If flag_verbose_seen is already 1, keep it
+        // (short took precedence in flag_verbose slot); otherwise write
+        // k into flag_verbose. flag_verbose_seen becomes 1 regardless.
+        lea r11, [rip + flag_verbose_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne cpf_pop_verbose_long_only_seen;
+
+        // Was not previously seen — set slot too.
+        lea r11, [rip + flag_verbose];
+        mov [r11], rbx;
+
+      cpf_pop_verbose_long_only_seen:
+        mov rax, 1;
+        lea r11, [rip + flag_verbose_seen];
+        mov [r11], rax;
+
+        // ---- STD_ID_DRY_RUN (id 3) → flag_dry_run --------------------------
+      cpf_pop_dry_run:
+        mov rdi, 3;
+        call ParsedArgs::find_flag_by_id;
+        mov rbx, rax;
+        cmp rbx, 32;
+        jge cpf_pop_dry_run_absent;
+
+        lea r11, [rip + flag_dry_run];
+        mov [r11], rbx;
+        mov rax, 1;
+        lea r11, [rip + flag_dry_run_seen];
+        mov [r11], rax;
+        jmp cpf_pop_over_existing;
+
+      cpf_pop_dry_run_absent:
+        xor rax, rax;
+        lea r11, [rip + flag_dry_run];         mov [r11], rax;
+        lea r11, [rip + flag_dry_run_seen];    mov [r11], rax;
+
+        // ---- CP_ID_OVER_EXISTING (id 102) → flag_over_existing -------------
+      cpf_pop_over_existing:
+        mov rdi, 102;
+        call ParsedArgs::find_flag_by_id;
+        mov rbx, rax;
+        cmp rbx, 32;
+        jge cpf_pop_over_existing_absent;
+
+        lea r11, [rip + flag_over_existing];
+        mov [r11], rbx;
+        mov rax, 1;
+        lea r11, [rip + flag_over_existing_seen];
+        mov [r11], rax;
+        jmp cpf_pop_epilogue;
+
+      cpf_pop_over_existing_absent:
+        xor rax, rax;
+        lea r11, [rip + flag_over_existing];        mov [r11], rax;
+        lea r11, [rip + flag_over_existing_seen];   mov [r11], rax;
+
+        // ---- Epilogue -------------------------------------------------------
+      cpf_pop_epilogue:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

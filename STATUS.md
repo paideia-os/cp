@@ -1,7 +1,7 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M1 (design + skeleton) — complete
+**Current milestone:** M2 (core implementation) — in progress
 
 ## Milestone map
 
@@ -15,11 +15,14 @@
   sys_close. `KIND_PDXFS_TXN` begin/commit are M1 stubs (return 0)
   because the kernel does not yet expose txn syscalls; the M2 patch
   swaps only the two stub bodies.
-- **M2 — core implementation (not started).** Recursive `-r`, cap-
-  tail preservation (re-sign at destination under invoker's user_sk
-  if unlocked; graceful `--verbose` degrade otherwise), real single-
-  TXN atomicity across the whole invocation, `--over-existing` undo
-  record on PdxFS v1.
+- **M2 — core implementation (in progress).** Recursive `-r` walk
+  via `Walk::walk_recursive` gated behind libpdx-argv typed-flag
+  registration (issue #4 — LANDED). Cap-tail preservation stub via
+  `SignedInode::preserve_at_destination` (issue #5). Graceful
+  signed-inode degrade with `--verbose` diagnostic (issue #6).
+  Single-TXN atomicity hoisted to dispatch level with `txn_abort` on
+  partial failure (issue #7). `--over-existing` PdxFS v1 undo record
+  via `Undo::record_over_existing` stub (issue #8).
 - **M3 — semantic-pipe / audit integration (not started).**
   CopyProgressRecord[] per file via libpdx-semantic-pipe; CopyRecord
   pre-output journal via libpdx-audit; libpdx-elevate retry when

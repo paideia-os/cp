@@ -1,4 +1,4 @@
-// src/main.pdx — cp.M1-002
+// src/main.pdx — cp.M1-002 + cp.M2-001 (typed flag registration)
 // CpMain module: cp_main(argc, argv) entry point.
 //
 // Scope
@@ -8,19 +8,28 @@
 // cp_main's return value is the process exit code the loader stub
 // passes to sys_exit (paideia-os syscall #60).
 //
-// Flow:
-//   1. ParsedArgs::reset() — zero libpdx-argv's parse state.
-//   2. Parser::parse_argv(argv, argc) — walk argv into ParsedArgs.
+// Flow (M2):
+//   1. FlagSpec::reset()                — clear libpdx-argv's typed-flag
+//                                          registration table.
+//   2. StdVocab::register_all()         — register the 9 standard flags
+//                                          (--help/--version/--dry-run/
+//                                          --json/--schema/--verbose/
+//                                          --quiet/--color/--no-cap).
+//   3. CpFlags::register_cp_flags()     — register cp's own three flag
+//                                          names: -r, -v, --over-existing
+//                                          (see src/flags.pdx).
+//   4. ParsedArgs::reset()              — zero libpdx-argv's parse state.
+//   5. Parser::parse_argv(argv, argc)   — walk argv into ParsedArgs.
 //      If it returns non-zero, print a short usage line on stderr
 //      and return exit code 2 (usage error). A later milestone
 //      replaces the hand-rolled diagnostic with a doc-back-end call
 //      once `doc cp --help` reaches a stable release (see the
 //      cross-repo dep in the plan doc §5.6 M5 line).
-//   3. Dispatch::dispatch_copy() — validates flags + positional count
-//      and either runs the M1-003 copy body or exits with a
-//      distinguishing code (3 for recognised-but-not-wired-yet, 2 for
-//      wrong positional count).
-//   4. Return the dispatch call's exit code.
+//   6. Dispatch::dispatch_copy()        — mirrors CpFlags, validates
+//                                          positional count, and routes
+//                                          to Walk::walk_recursive (-r)
+//                                          or CopyFile::copy_single_file.
+//   7. Return the dispatch call's exit code.
 //
 // paideia-as compliance
 // ---------------------
@@ -35,6 +44,9 @@
 //
 // Cross-module externs consumed
 // -----------------------------
+//   FlagSpec::reset              (libpdx-argv)
+//   StdVocab::register_all       (libpdx-argv)
+//   CpFlags::register_cp_flags   (this repo, src/flags.pdx)
 //   ParsedArgs::reset            (libpdx-argv)
 //   Parser::parse_argv           (libpdx-argv)
 //   Dispatch::dispatch_copy      (this repo, src/dispatch.pdx)
@@ -86,7 +98,7 @@ module CpMain = structure {
   pub let cp_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M1-002 cp_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv → hand off to Dispatch::dispatch_copy (which walks ParsedArgs .bss for the positional-count check + the -r flag gate + the M1-003 copy body call). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (Parser::parse_argv, ParsedArgs::reset, Dispatch::dispatch_copy, Print::print_err). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see its Parser::parse_argv justification which declares leaf semantics; ParsedArgs::reset is trivially leaf). Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Otherwise: tail-call-in-body-shape into Dispatch::dispatch_copy whose return value is our own. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
+      justification: "cp.M1-002 cp_main + cp.M2-001 typed-flag registration. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: register-flags via libpdx-argv (FlagSpec::reset → StdVocab::register_all → CpFlags::register_cp_flags) → parse via libpdx-argv → hand off to Dispatch::dispatch_copy. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (7 calls now including the three new registration ones). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see Parser::parse_argv's justification for leaf semantics; ParsedArgs::reset and FlagSpec::reset are trivially leaf; StdVocab::register_all and CpFlags::register_cp_flags declare their own 1-push alignment for their nested register calls). Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Otherwise: tail-call-in-body-shape into Dispatch::dispatch_copy whose return value is our own. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying the dispatched body's exit code (or 2 on parse-fail).",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 → 0
@@ -96,15 +108,20 @@ module CpMain = structure {
         mov rbx, rsi;                          // rbx = argv
         mov r12, rdi;                          // r12 = argc
 
-        // Step 1: reset libpdx-argv state.
+        // Step 1: reset FlagSpec and register the standard + cp flags.
+        call FlagSpec::reset;
+        call StdVocab::register_all;
+        call CpFlags::register_cp_flags;
+
+        // Step 2: reset libpdx-argv parse state.
         call ParsedArgs::reset;
 
-        // Step 2: parse. rdi = argv, rsi = argc.
+        // Step 3: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
         mov rsi, r12;
         call Parser::parse_argv;
 
-        // Step 3: check parse error. rax == 0 (ERR_OK) → continue.
+        // Step 4: check parse error. rax == 0 (ERR_OK) → continue.
         cmp rax, 0;
         je cp_main_parse_ok;
 
@@ -117,8 +134,9 @@ module CpMain = structure {
         jmp cp_main_epilogue;
 
       cp_main_parse_ok:
-        // Step 4: dispatch. dispatch_copy walks ParsedArgs (.bss)
-        // for the flag gate + positional-count check + copy call.
+        // Step 5: dispatch. dispatch_copy mirrors CpFlags from
+        // ParsedArgs and routes to Walk::walk_recursive (-r) or
+        // CopyFile::copy_single_file.
         call Dispatch::dispatch_copy;
         // rax now carries dispatch's exit code; fall through.
 

@@ -1,6 +1,8 @@
 # cp — paideia-as build manifest
 #
-# Wave: R50  Milestone: M1 (design + skeleton)
+# Wave: R50  Milestone: M2 (core implementation — recursive -r walk,
+#                            single-TXN atomicity, --over-existing undo,
+#                            cap-tail preservation)
 # Doc:   design/tooling/r49-r50-plan.md §5.6 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
@@ -15,7 +17,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step at M5.
 
 name        = cp
-version     = 0.1.0-m1
+version     = 0.2.0-m2
 kind        = tool
 entry       = CpMain::cp_main
 output      = build-out/cp
@@ -24,26 +26,32 @@ caps_decl   = caps.decl
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
 #
-# Grouped by the M1 issue that adds each file:
+# Grouped by the milestone-issue that adds each file:
 #   M1-002 lands: print, dispatch, main (argv surface + flag gate).
 #   M1-003 lands: pdxfs, copy (first-runnable single-file copy).
+#   M2-001 lands: flags, walk (typed-flag registration + recursive walk).
+#   M2-002 lands: signed_inode (cap-tail preservation stub).
+#   M2-005 lands: undo (--over-existing PdxFS v1 undo record stub).
 sources:
   - src/print.pdx                 # M1-002 sys_write(fd=1/2) helper
-  - src/pdxfs.pdx                 # M1-003 open/read/write/close + TXN stubs
-  - src/copy.pdx                  # M1-003 single-file copy body
-  - src/dispatch.pdx              # M1-002 flag gate + positional-count validate
-  - src/main.pdx                  # M1-002 cp_main(argc, argv) entry point
+  - src/pdxfs.pdx                 # M1-003 + M2 open/read/write/close/txn/readdir/mkdir/stat
+  - src/copy.pdx                  # M1-003 + M2 single-file copy body (bytes-only extract)
+  - src/dispatch.pdx              # M1-002 + M2 flag gate + typed flags + recursive route
+  - src/main.pdx                  # M1-002 + M2 cp_main(argc, argv) entry point
+  - src/flags.pdx                 # M2-001 CpFlags: typed-flag registration + mirror
+  - src/walk.pdx                  # M2-001 Walk: recursive -r directory walk
 
 # --- Library dependencies -----------------------------------------------
-# Only libpdx-argv at M1 (main uses it to parse the argv surface). The
-# other four shared libraries land later:
+# M2 pulls libpdx-argv ≥ 0.2 (FlagSpec + StdVocab + find_flag_by_id
+# from libpdx-argv M2). The other four shared libraries land later:
 #   libpdx-semantic-pipe → M3-001 (CopyProgressRecord[] emit)
 #   libpdx-audit         → M3-002 (CopyRecord pre-output journal)
 #   libpdx-elevate       → M3-003 (cross-subtree elevate retry)
-#   libpdx-cap           → M2 (signed-inode preservation via caps_decl_verify
-#                              at exec; M1 verify is loader-side stubbed).
+#   libpdx-cap           → M2 substrate-only today (signed-inode helpers
+#                              land in libpdx-cap.M3 — cp.M2's signed_inode
+#                              module is a shape-in-place stub until then).
 deps:
-  - libpdx-argv @ ^0.1
+  - libpdx-argv @ ^0.2
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

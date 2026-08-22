@@ -1,0 +1,297 @@
+// src/walk.pdx — cp.M2-001
+// Walk module: recursive directory walk for `cp -r <src-dir> <dst-dir>`.
+//
+// Scope
+// -----
+// M2's recursive `-r` shape: cp accepts either two file arguments
+// (single-file copy — dispatched to CopyFile::copy_single_file) or,
+// with `-r`, two directory arguments (recursive walk — dispatched
+// here). The per-invocation single-TXN wrap lives at dispatch level
+// (cp.M2-004); this module only walks + copies bytes.
+//
+// Shape today (M2-001 with stubbed substrate):
+//   1. pdxfs_mkdir(dst, 0o755) — Pdxfs stub returns 0 (created).
+//   2. pdxfs_open(src, O_RDONLY = 0) — opens the source directory as
+//      a fd; the substrate's directory-open semantics land with the
+//      full R42 fs stack. Today sys_open forwards the flags word
+//      verbatim so this returns whatever the substrate gives back;
+//      Walk treats a negative errno as an error.
+//   3. pdxfs_readdir loop — Pdxfs stub returns 0 = EOF immediately,
+//      so the per-entry body (deferred to the R42 substrate landing)
+//      does not execute. When readdir lands the walker parses the
+//      returned buffer as an array of dirent records and, per entry,
+//      copies (regular file → CopyFile::copy_bytes_only) or recurses
+//      (directory → walk_recursive on the child paths).
+//   4. pdxfs_close(fd) — release the directory fd.
+//   5. Return 0 (success).
+//
+// The per-entry copy path is stubbed with a `walk_entry_todo` block
+// that is present in-line but jumps only from the (unreachable at M2)
+// "readdir returned N > 0" edge. When readdir starts returning real
+// entry counts, walk_entry_todo becomes the entry-parsing hot path;
+// its shape today shows the intended data flow (name concat, stat,
+// dispatch on regular/dir) so the R42 landing is a body-edit rather
+// than a re-architecture.
+//
+// Single-TXN wrap
+// ---------------
+// walk_recursive does NOT open its own KIND_PDXFS_TXN. The outer
+// TXN is opened once at dispatch level (cp.M2-004) so the whole
+// `cp -r` invocation lives inside one transaction — a per-file
+// failure aborts every already-written destination byte at the TXN
+// boundary. This matches the "single-TXN atomicity across whole
+// invocation" line in plan §5.6.
+//
+// Cap-tail preservation + undo-record hooks
+// -----------------------------------------
+// SignedInode::preserve_at_destination (cp.M2-002/M2-003) is
+// invoked once per successfully-copied file in the per-entry body
+// (walk_entry_todo — see the TODO comment there). The undo-record
+// hook for --over-existing (cp.M2-005) lives inside
+// CopyFile::copy_bytes_only, so walk_recursive does not need to
+// invoke Undo::* directly — the copy body handles the pre-overwrite
+// journal on its own.
+//
+// Verbose diagnostic
+// ------------------
+// When CpFlags::flag_verbose_seen != 0, walk_recursive prints a
+// short per-directory diagnostic on stderr before descending. M2-001
+// keeps the diagnostic minimal (one line naming the src dir); M3
+// upgrades it to a CopyProgressRecord[] emit via libpdx-semantic-pipe.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module Walk (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest: 4096 = WALK_ENTRY_BUF_LEN,
+//     0x1ED = 493 for 0o755 mkdir mode).
+//   - r11 is scratch (every lea for .bss / .rodata addresses).
+//   - Byte loads not needed body-side at M2 (entry-parsing lands with
+//     readdir substrate).
+//   - 5-push prologue (rbx=src, r12=dst, r13=fd_src_dir, r14=n_read,
+//     r15=unused) → rsp%16 == 0 at every nested call site.
+//     Matching 5-pop epilogue.
+
+module Walk = structure {
+
+  // -- Directory entry read buffer. 4 KiB matches the typical page-
+  // -- size fingerprint (same trade-off as CopyFile::copy_buf).
+  // -- Substrate-defined dirent record format is TBD (softarch Round
+  // -- 3 open question); this buffer holds one readdir batch.
+  pub let WALK_ENTRY_BUF_LEN : u64 = 4096
+  pub let mut walk_entry_buf : [u8; 4096] = uninit @align(8)
+
+  // -- .bss counters (single walk_recursive invocation is a full cp -r).
+  pub let mut fd_src_dir     : u64 = uninit @align(8)
+  pub let mut entries_visited: u64 = uninit @align(8)
+
+  // -- Diagnostic strings. Every error path prints one line on stderr
+  // -- and returns 1 (EXIT_OP_FAIL); the verbose diagnostic prints one
+  // -- line on stderr on entry and continues.
+  pub let MKDIR_FAIL_MSG : [u8; 31] =
+    "cp: cannot create destination\n"
+  pub let MKDIR_FAIL_MSG_LEN : u64 = 31
+
+  pub let OPEN_SRCDIR_FAIL_MSG : [u8; 33] =
+    "cp: cannot open source directory\n"
+  pub let OPEN_SRCDIR_FAIL_MSG_LEN : u64 = 33
+
+  pub let READDIR_FAIL_MSG : [u8; 30] =
+    "cp: readdir on source failed\n"
+  pub let READDIR_FAIL_MSG_LEN : u64 = 30
+
+  pub let VERBOSE_ENTER_MSG : [u8; 22] =
+    "cp: -r walk entering\n"
+  pub let VERBOSE_ENTER_MSG_LEN : u64 = 22
+
+  // ============================================================================
+  // walk_reset()
+  //
+  // Signature: walk_reset : () -> () !{mem} @{}
+  //
+  // Zero the two counter slots (fd_src_dir, entries_visited) so a
+  // subsequent walk_recursive starts from a known baseline. Mirrors
+  // CopyFile::copy_reset shape. Leaf; r11 scratch.
+  // ============================================================================
+  pub let walk_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.M2-001 Walk::walk_reset. Zero the two counter slots (fd_src_dir, entries_visited) so walk_recursive starts from a known baseline. walk_entry_buf is index-consumed (parsed left-to-right on each readdir batch) so it does not need zeroing. r11 scratch; xor rax,rax produces the zero. Leaf; mirror of CopyFile::copy_reset.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + fd_src_dir];       mov [r11], rax;
+        lea r11, [rip + entries_visited];  mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_recursive(src_ptr, dst_ptr) -> exit_code
+  //
+  // Signature: walk_recursive : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): src_ptr — VA of a NUL-terminated source directory path
+  // RSI (input): dst_ptr — VA of a NUL-terminated destination directory path
+  // RAX (output): 0 on success, 1 on any syscall error
+  //
+  // Body flow (see file-header "Shape today" for the full narrative):
+  //   1. walk_reset
+  //   2. (optional verbose diagnostic on stderr)
+  //   3. pdxfs_mkdir(dst_ptr, 0o755)          → check negative errno
+  //   4. pdxfs_open(src_ptr, O_RDONLY = 0)    → r13 = fd_src_dir
+  //   5. Readdir loop:
+  //        pdxfs_readdir(fd, walk_entry_buf, WALK_ENTRY_BUF_LEN)
+  //        rax < 0 → readdir_fail
+  //        rax == 0 → walk_readdir_eof (done)
+  //        rax > 0 → walk_entry_todo (M2 dead code; parse entries)
+  //   6. pdxfs_close(fd_src_dir)
+  //   7. Return 0
+  //
+  // Register plan (5-push prologue → rsp%16 == 0 at nested calls):
+  //   rbx = src_ptr        (preserved across every call)
+  //   r12 = dst_ptr        (preserved across every call)
+  //   r13 = fd_src_dir     (from pdxfs_open; preserved across every call)
+  //   r14 = readdir return (bytes emitted into walk_entry_buf; needed
+  //                         inside the per-entry parse loop at M3+)
+  //   r15 = unused         (pushed for alignment parity with copy.pdx's
+  //                         5-push shape; reserved for M3's per-entry
+  //                         cursor into walk_entry_buf)
+  // Scratch: rax (return), rdi/rsi/rdx (syscall args), r11 (every lea).
+  // ============================================================================
+  pub let walk_recursive : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp.M2-001 Walk::walk_recursive. Recursive-shape entry point for `cp -r <src-dir> <dst-dir>`. 5-push prologue (rbx=src, r12=dst, r13=fd_src_dir, r14=readdir bytes, r15=unused reserved for M3 walk_entry_buf cursor) → rsp%16==0 at every nested call site. Body: mkdir dst (stubbed to 0); open src as dir; readdir loop (stubbed to 0=EOF, exits immediately); close dst_fd; return 0. Per-entry parse body (walk_entry_todo) is present in-line but unreachable today — Pdxfs::pdxfs_readdir returns 0 unconditionally. When R42 substrate lands the readdir call starts returning bytes-of-dirent-records and walk_entry_todo becomes the hot path; the M3 landing parses walk_entry_buf as an array of dirent records and, per entry, calls CopyFile::copy_bytes_only (regular file) or self-recurses (directory) on concatenated child paths. Verbose diagnostic (one line on stderr) fires at entry when CpFlags::flag_verbose_seen != 0. Error branches share a single walk_epilogue that pops all 5 callee-save regs; rax carries the exit code out. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (0x1ED = 493 for 0o755 is the largest). Negative-errno detection uses cmp rax,0; jl (signed compare). sysreg effect declared for the syscall clobber shape.",
+      block: {
+        // ---- Prologue --------------------------------------------------------
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+        push r14;                              // rsp%16: 0 → 8
+        push r15;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = src_ptr
+        mov r12, rsi;                          // r12 = dst_ptr
+
+        // ---- Step 1: reset state --------------------------------------------
+        call Walk::walk_reset;
+
+        // ---- Step 2: verbose diagnostic (optional) --------------------------
+        // Skip when flag_verbose_seen == 0. Reading the mirror slot
+        // rather than re-querying ParsedArgs keeps the fast-path free
+        // of the linear scan over flag_ids.
+        lea r11, [rip + CpFlags::flag_verbose_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        je walk_verbose_done;
+
+        lea rdi, [rip + VERBOSE_ENTER_MSG];
+        mov rsi, 22;                           // VERBOSE_ENTER_MSG_LEN
+        call Print::print_err;
+
+      walk_verbose_done:
+
+        // ---- Step 3: mkdir destination (0o755 = 0x1ED) ----------------------
+        mov rdi, r12;                          // dst_ptr
+        mov rsi, 0x1ED;                        // 0o755 permission bits
+        call Pdxfs::pdxfs_mkdir;
+        cmp rax, 0;
+        jl walk_mkdir_fail;
+
+        // ---- Step 4: open source directory (O_RDONLY = 0) -------------------
+        mov rdi, rbx;                          // src_ptr
+        mov rsi, 0;                            // O_RDONLY
+        call Pdxfs::pdxfs_open;
+        cmp rax, 0;
+        jl walk_open_srcdir_fail;
+
+        mov r13, rax;                          // r13 = fd_src_dir
+        lea r11, [rip + fd_src_dir];
+        mov [r11], rax;
+
+        // ---- Step 5: readdir loop -------------------------------------------
+      walk_readdir_head:
+        mov rdi, r13;                          // fd_src_dir
+        lea rsi, [rip + walk_entry_buf];       // buf
+        mov rdx, 4096;                         // WALK_ENTRY_BUF_LEN
+        call Pdxfs::pdxfs_readdir;
+
+        cmp rax, 0;
+        jl walk_readdir_fail;                  // negative errno → error
+        je walk_readdir_eof;                   // 0 → end of directory
+
+        // rax > 0: entries returned. Fall through to walk_entry_todo.
+        mov r14, rax;                          // r14 = readdir bytes
+
+      walk_entry_todo:
+        // M2-001 dead code at runtime — Pdxfs::pdxfs_readdir stub
+        // returns 0 unconditionally so this block is unreachable today.
+        // At R42 substrate landing this block will parse walk_entry_buf
+        // as an array of dirent records and, per entry:
+        //   - Concatenate: entry_src = rbx + "/" + entry.name
+        //   - Concatenate: entry_dst = r12 + "/" + entry.name
+        //   - Bump entries_visited counter
+        //   - If entry.type == regular file:
+        //       call CopyFile::copy_bytes_only(entry_src, entry_dst)
+        //       call SignedInode::preserve_at_destination
+        //             (cap-tail re-sign per M2-002; graceful degrade
+        //              per M2-003)
+        //   - Else if entry.type == directory:
+        //       call Walk::walk_recursive(entry_src, entry_dst)  [self-recursion]
+        //   - Else (symlink, device, socket, etc.):
+        //       skip with a --verbose diagnostic
+        // Then jump back to walk_readdir_head for the next batch.
+        //
+        // For today, immediately loop back — the stub means we never
+        // arrive here, but if the stub ever returned a positive value
+        // by accident we would spin forever without this jump. Keeping
+        // it as an explicit jump makes that failure mode observable
+        // rather than silent.
+        jmp walk_readdir_head;
+
+        // ---- Success epilogue: close fd, return 0 ---------------------------
+      walk_readdir_eof:
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        xor rax, rax;                          // EXIT_OK (0)
+        jmp walk_epilogue;
+
+        // ---- Error branches -------------------------------------------------
+        // Ordered by "how many fds are open":
+        //   0 fds: walk_mkdir_fail, walk_open_srcdir_fail
+        //   1 fd  (fd_src_dir): walk_readdir_fail
+      walk_mkdir_fail:
+        lea rdi, [rip + MKDIR_FAIL_MSG];
+        mov rsi, 31;                           // MKDIR_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;                            // EXIT_OP_FAIL
+        jmp walk_epilogue;
+
+      walk_open_srcdir_fail:
+        lea rdi, [rip + OPEN_SRCDIR_FAIL_MSG];
+        mov rsi, 33;                           // OPEN_SRCDIR_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp walk_epilogue;
+
+      walk_readdir_fail:
+        mov rdi, r13;
+        call Pdxfs::pdxfs_close;
+
+        lea rdi, [rip + READDIR_FAIL_MSG];
+        mov rsi, 30;                           // READDIR_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 1;
+        jmp walk_epilogue;
+
+        // ---- Shared epilogue ------------------------------------------------
+      walk_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
