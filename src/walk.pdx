@@ -1,37 +1,69 @@
-// src/walk.pdx — cp.M2-001
+// src/walk.pdx — cp.M2-001 (skeleton) + cp.ENH-002/ENH-003 (real walk body)
 // Walk module: recursive directory walk for `cp -r <src-dir> <dst-dir>`.
 //
 // Scope
 // -----
 // M2's recursive `-r` shape: cp accepts either two file arguments
-// (single-file copy — dispatched to CopyFile::copy_single_file) or,
+// (single-file copy — dispatched to CopyFile::copy_bytes_only) or,
 // with `-r`, two directory arguments (recursive walk — dispatched
 // here). The per-invocation single-TXN wrap lives at dispatch level
 // (cp.M2-004); this module only walks + copies bytes.
 //
-// Shape today (M2-001 with stubbed substrate):
-//   1. pdxfs_mkdir(dst, 0o755) — Pdxfs stub returns 0 (created).
-//   2. pdxfs_open(src, O_RDONLY = 0) — opens the source directory as
-//      a fd; the substrate's directory-open semantics land with the
-//      full R42 fs stack. Today sys_open forwards the flags word
-//      verbatim so this returns whatever the substrate gives back;
-//      Walk treats a negative errno as an error.
-//   3. pdxfs_readdir loop — Pdxfs stub returns 0 = EOF immediately,
-//      so the per-entry body (deferred to the R42 substrate landing)
-//      does not execute. When readdir lands the walker parses the
-//      returned buffer as an array of dirent records and, per entry,
-//      copies (regular file → CopyFile::copy_bytes_only) or recurses
-//      (directory → walk_recursive on the child paths).
-//   4. pdxfs_close(fd) — release the directory fd.
-//   5. Return 0 (success).
+// ENH-002/ENH-003 (this landing): real walk body
+// -----------------------------------------------
+// cp v1.0.0 shipped with Pdxfs::pdxfs_readdir/pdxfs_mkdir stubbed to
+// always-EOF / always-success, so `cp -r src dst` silently exited 0
+// having copied nothing — an active data-loss hazard for the
+// `cp -r a b && rm -r a` idiom (see doc/enhancement-plan.md §3.1).
+// The R56.M3 VFS-metadata substrate (#1790-#1793, sysnos 77-79) landed
+// after that release and cp.ENH-001 (src/pdxfs.pdx) flips the three
+// trampolines to real syscalls. This landing lands the walker body
+// that actually consumes them.
 //
-// The per-entry copy path is stubbed with a `walk_entry_todo` block
-// that is present in-line but jumps only from the (unreachable at M2)
-// "readdir returned N > 0" edge. When readdir starts returning real
-// entry counts, walk_entry_todo becomes the entry-parsing hot path;
-// its shape today shows the intended data flow (name concat, stat,
-// dispatch on regular/dir) so the R42 landing is a body-edit rather
-// than a re-architecture.
+// Explicit worklist instead of self-recursion
+// --------------------------------------------
+// A naive port would have walk_recursive call itself once per child
+// directory. Two things make that wrong on paideia-os as it stands
+// today:
+//
+//   1. Reentrancy: walk_entry_buf (the 4 KiB readdir batch buffer) and
+//      fd_src_dir were module-level .bss singletons. A nested call
+//      processing a subdirectory would readdir into the SAME buffer
+//      the parent's in-progress batch still needs, corrupting the
+//      parent's remaining entries out from under it.
+//   2. Stack budget: sys_execve_shim.pdx allocates EXECVE_USER_STACK_
+//      PAGES = 4 pages (16 KiB) for a fresh process's user stack. A
+//      self-recursive walker with per-level path buffers would burn
+//      several KiB of that per directory-tree level — a handful of
+//      levels deep and cp would corrupt its own stack silently
+//      (exactly the kind of failure this round exists to eliminate,
+//      not reintroduce).
+//
+// Both problems disappear with an explicit worklist: walk_recursive
+// pushes (src, dst) directory pairs onto a bounded .bss LIFO
+// (Walk::pending_*) instead of calling itself, and its own body is an
+// ordinary loop that pops one pending directory at a time, fully
+// drains + closes its readdir fd before popping the next. Only one
+// directory is ever "open" at a time, so walk_entry_buf has exactly
+// one live reader/writer and the call stack never grows with tree
+// depth — cp's stack footprint is now O(1) in directory-tree depth
+// AND width (bounded by MAX_PENDING_DIRS; see walk_pending_push).
+//
+// MAX_PENDING_DIRS = 128 bounds how many subdirectories can be queued
+// awaiting processing at once (the sum, across every not-yet-fully-
+// processed ancestor, of "subdirectories seen but not yet popped" —
+// not tree depth). A tree that overflows this is a WALK_PENDING_FULL
+// diagnostic + exit 1 (the outer TXN abort unwinds every byte already
+// written) — fail loud, never the silent-success cp v1.0.0 shipped
+// with. Raising the bound later is a one-line .bss size change.
+//
+// Path length: PATH_MAX = 256, matching every kernel-side path buffer
+// cp already depends on (SYS_STAT_PATH_MAX, SYS_MKDIR_PATH_MAX,
+// DISPATCH_PATH_MAX all = 256). Walk::walk_path_join clips rather than
+// overflows when a concatenated child path would exceed 255 chars +
+// NUL — a path that long would not round-trip through sys_stat /
+// sys_mkdir correctly either, so this is not a new limitation cp
+// introduces, just the existing system-wide one made explicit here.
 //
 // Single-TXN wrap
 // ---------------
@@ -40,56 +72,76 @@
 // `cp -r` invocation lives inside one transaction — a per-file
 // failure aborts every already-written destination byte at the TXN
 // boundary. This matches the "single-TXN atomicity across whole
-// invocation" line in plan §5.6.
+// invocation" line in plan §5.6. (The TXN begin/commit/abort bodies
+// are themselves still stubs pending kernel-side sys_pdxfs_txn_commit/
+// abort ordinals — see cp.ENH-007 / Pdxfs::pdxfs_txn_begin — so the
+// atomicity guarantee is not real yet even though the wiring is.)
 //
-// Cap-tail preservation + undo-record hooks
-// -----------------------------------------
-// SignedInode::preserve_at_destination (cp.M2-002/M2-003) is
-// invoked once per successfully-copied file in the per-entry body
-// (walk_entry_todo — see the TODO comment there). The undo-record
-// hook for --over-existing (cp.M2-005) lives inside
-// CopyFile::copy_bytes_only, so walk_recursive does not need to
-// invoke Undo::* directly — the copy body handles the pre-overwrite
-// journal on its own.
+// Cap-tail preservation + undo-record + progress-emit hooks
+// -----------------------------------------------------------
+// CopyFile::copy_bytes_only already calls SignedInode::
+// preserve_at_destination, Undo::maybe_record_over_existing, and
+// CpPipe::cp_pipe_emit_progress internally for every file it copies
+// (see copy.pdx). Because walk_recursive's per-entry regular-file
+// path calls copy_bytes_only directly, every one of those M2/M3 hooks
+// fires per recursive-copy entry for free — no separate call site is
+// needed here, unlike the M2-001 TODO comment this file used to carry.
 //
 // Verbose diagnostic
 // ------------------
-// When CpFlags::flag_verbose_seen != 0, walk_recursive prints a
-// short per-directory diagnostic on stderr before descending. M2-001
-// keeps the diagnostic minimal (one line naming the src dir); M3
-// upgrades it to a CopyProgressRecord[] emit via libpdx-semantic-pipe.
-//
-// M3-001 per-entry emission (deferred with readdir substrate)
-// -----------------------------------------------------------
-// walk_entry_todo below documents the CpPipe::cp_pipe_emit_progress
-// call site: after each per-entry copy_bytes_only succeeds, walk
-// emits one CopyProgressRecord (src=concat(rbx, entry.name),
-// dst=concat(r12, entry.name), bytes_copied=CopyFile::bytes_copied,
-// bytes_total=same at M3). The single-file path in
-// CopyFile::copy_bytes_only already emits its own record at M3, so
-// walk's per-entry emit lands together with the R42 readdir body-edit.
+// When CpFlags::flag_verbose_seen != 0, walk_recursive prints a short
+// diagnostic on stderr before descending into each popped directory
+// (naming the directory currently being processed).
 //
 // paideia-as compliance
 // ---------------------
 //   - Module Walk (PascalCase basename).
 //   - No test mnemonic; every zero-check via cmp reg, 0.
-//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest: 4096 = WALK_ENTRY_BUF_LEN,
-//     0x1ED = 493 for 0o755 mkdir mode).
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (largest: 4096 = WALK_ENTRY_BUF_LEN).
 //   - r11 is scratch (every lea for .bss / .rodata addresses).
-//   - Byte loads not needed body-side at M2 (entry-parsing lands with
-//     readdir substrate).
-//   - 5-push prologue (rbx=src, r12=dst, r13=fd_src_dir, r14=n_read,
-//     r15=unused) → rsp%16 == 0 at every nested call site.
-//     Matching 5-pop epilogue.
+//   - mov_b / mov_w byte/word loads and stores follow the proven
+//     xor-then-narrow-op idiom used throughout paideia-os (see
+//     src/user/mkdir.pdx's mkdir_strlen_loop, src/user/ls.pdx's
+//     per-record name_len load) — pre-zero the destination register,
+//     then mov_b/mov_w so the upper bits are guaranteed zero.
+//   - No `add reg, [mem]` / `sub reg, [mem]` (encoder-gap discipline);
+//     every accumulate is load-to-reg, arithmetic, store-back.
+//   - Register-scaled addressing `[base + idx*1]` for every byte copy
+//     loop, matching the proven pattern at path.pdx / readdir.pdx /
+//     svc_broker.pdx (mov_b [reg+reg*1], reg).
 
 module Walk = structure {
 
   // -- Directory entry read buffer. 4 KiB matches the typical page-
-  // -- size fingerprint (same trade-off as CopyFile::copy_buf).
-  // -- Substrate-defined dirent record format is TBD (softarch Round
-  // -- 3 open question); this buffer holds one readdir batch.
+  // -- size fingerprint and the kernel's own GETDENTS_IO_MAX cap.
+  // -- Module-level singleton is safe now: only one directory is ever
+  // -- "open" at a time (see file-header note on the explicit worklist).
   pub let WALK_ENTRY_BUF_LEN : u64 = 4096
   pub let mut walk_entry_buf : [u8; 4096] = uninit @align(8)
+
+  // -- Path buffers. PATH_MAX = 256 throughout (matches SYS_STAT_
+  // -- PATH_MAX / SYS_MKDIR_PATH_MAX). cur_src_buf/cur_dst_buf hold the
+  // -- directory currently being processed (popped off the pending
+  // -- worklist); entry_src_scratch/entry_dst_scratch hold the child
+  // -- path being built for the entry currently under the readdir
+  // -- cursor. All four are module-level singletons — safe for the
+  // -- same single-directory-open-at-a-time reason as walk_entry_buf.
+  pub let PATH_MAX : u64 = 256
+  pub let mut cur_src_buf        : [u8; 256] = uninit @align(8)
+  pub let mut cur_dst_buf        : [u8; 256] = uninit @align(8)
+  pub let mut cur_src_len        : u64       = uninit @align(8)
+  pub let mut cur_dst_len        : u64       = uninit @align(8)
+  pub let mut entry_src_scratch  : [u8; 256] = uninit @align(8)
+  pub let mut entry_dst_scratch  : [u8; 256] = uninit @align(8)
+
+  // -- Explicit pending-directory worklist (LIFO). Each slot is a
+  // -- fixed 256-byte NUL-terminated path; slot i's src/dst pair lives
+  // -- at pending_src_paths[i*256] / pending_dst_paths[i*256]. See
+  // -- file-header note on why this replaces self-recursion.
+  pub let MAX_PENDING_DIRS   : u64 = 128
+  pub let mut pending_src_paths : [u8; 32768] = uninit @align(8)  // 128 * 256
+  pub let mut pending_dst_paths : [u8; 32768] = uninit @align(8)  // 128 * 256
+  pub let mut pending_count     : u64         = uninit @align(8)
 
   // -- .bss counters (single walk_recursive invocation is a full cp -r).
   pub let mut fd_src_dir     : u64 = uninit @align(8)
@@ -97,7 +149,7 @@ module Walk = structure {
 
   // -- Diagnostic strings. Every error path prints one line on stderr
   // -- and returns 1 (EXIT_OP_FAIL); the verbose diagnostic prints one
-  // -- line on stderr on entry and continues.
+  // -- line on stderr per popped directory and continues.
   pub let MKDIR_FAIL_MSG : [u8; 31] =
     "cp: cannot create destination\n"
   pub let MKDIR_FAIL_MSG_LEN : u64 = 31
@@ -114,23 +166,331 @@ module Walk = structure {
     "cp: -r walk entering\n"
   pub let VERBOSE_ENTER_MSG_LEN : u64 = 22
 
+  pub let PENDING_FULL_MSG : [u8; 52] =
+    "cp: too many pending subdirectories (worklist full)\n"
+  pub let PENDING_FULL_MSG_LEN : u64 = 52
+
   // ============================================================================
   // walk_reset()
   //
   // Signature: walk_reset : () -> () !{mem} @{}
   //
-  // Zero the two counter slots (fd_src_dir, entries_visited) so a
-  // subsequent walk_recursive starts from a known baseline. Mirrors
-  // CopyFile::copy_reset shape. Leaf; r11 scratch.
+  // Zero fd_src_dir, entries_visited, and pending_count so a
+  // subsequent walk_recursive starts from a known baseline. The path
+  // buffers and pending arrays are index-consumed (always written
+  // before read) so they do not need zeroing. Leaf; r11 scratch.
   // ============================================================================
   pub let walk_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cp.M2-001 Walk::walk_reset. Zero the two counter slots (fd_src_dir, entries_visited) so walk_recursive starts from a known baseline. walk_entry_buf is index-consumed (parsed left-to-right on each readdir batch) so it does not need zeroing. r11 scratch; xor rax,rax produces the zero. Leaf; mirror of CopyFile::copy_reset.",
+      justification: "cp.M2-001 + cp.ENH-003 Walk::walk_reset. Zero fd_src_dir, entries_visited, and (NEW at ENH-003) pending_count so walk_recursive's explicit worklist starts empty. walk_entry_buf / cur_*_buf / entry_*_scratch / pending_*_paths are all index-consumed (every read site is preceded by a write of at least that many bytes) so they do not need zeroing. r11 scratch; xor rax,rax produces the zero. Leaf; mirror of CopyFile::copy_reset shape.",
       block: {
         xor rax, rax;
         lea r11, [rip + fd_src_dir];       mov [r11], rax;
         lea r11, [rip + entries_visited];  mov [r11], rax;
+        lea r11, [rip + pending_count];    mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_strlen(ptr) -> len
+  //
+  // Signature: walk_strlen : (u64) -> u64 !{mem} @{}
+  // RDI (input): ptr — VA of a NUL-terminated byte string
+  // RAX (output): length in [0, 255] (capped; matches PATH_MAX - 1)
+  //
+  // Byte-scan strlen capped at 255, identical idiom to src/user/
+  // mkdir.pdx's mkdir_strlen_loop: xor-then-mov_b pre-zero so the
+  // 8-bit load's upper bits are guaranteed zero before the cmp.
+  // Leaf; no callee-save touched (uses only rdi/rax/rcx).
+  // ============================================================================
+  pub let walk_strlen : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-003 Walk::walk_strlen. Byte-scan strlen capped at 255 (PATH_MAX-1), same idiom as src/user/mkdir.pdx's mkdir_strlen_loop: xor rax,rax pre-zero before each mov_b so the narrow load's upper bits are guaranteed zero for the cmp rax,0 NUL test. rcx is the index counter (not preserved — caller-save, this function is a leaf so nothing needs to survive across it). Used by Walk::walk_str_store to size copies for the pending-worklist push/pop and by walk_path_join callers to get base_len. Leaf; uses only rdi/rax/rcx.",
+      block: {
+        xor rcx, rcx;
+      walk_strlen_top:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        cmp rax, 0;
+        je walk_strlen_done;
+        add rcx, 1;
+        cmp rcx, 255;
+        jae walk_strlen_done;
+        jmp walk_strlen_top;
+      walk_strlen_done:
+        mov rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_str_store(dst_ptr, src_ptr) -> len
+  //
+  // Signature: walk_str_store : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst_ptr — VA of a >= 256-byte destination buffer
+  // RSI (input): src_ptr — VA of a NUL-terminated source string
+  // RAX (output): length copied (0..255)
+  //
+  // Computes walk_strlen(src_ptr), copies that many bytes from
+  // src_ptr to dst_ptr, and NUL-terminates dst_ptr[len]. Used both to
+  // seed a pending-worklist slot from a live path pointer and to pop
+  // a pending slot back out into cur_src_buf/cur_dst_buf — both are
+  // "copy one NUL-terminated string into a fixed buffer" so one
+  // primitive covers both call sites.
+  //
+  // Non-leaf (calls walk_strlen). 3-push prologue (rbx=dst_ptr,
+  // r12=src_ptr, r13=len) — entry rsp%16==8; three pushes land
+  // rsp%16==0 (matches CpElevate::cp_elevate_try_dst_parent's proven
+  // 3-push-no-pad arithmetic), no additional pad needed.
+  // ============================================================================
+  pub let walk_str_store : (u64, u64) -> u64 !{mem} @{} =
+    fn (dst_ptr: u64) (src_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-003 Walk::walk_str_store. Copies a NUL-terminated string from src_ptr into a caller-owned >=256-byte dst_ptr buffer and returns the copied length. 3-push prologue (rbx=dst_ptr, r12=src_ptr, r13=len, all preserved across the walk_strlen call) — entry rsp%16==8, three pushes land rsp%16==0 (8->0->8->0), matching CpElevate::cp_elevate_try_dst_parent's proven arithmetic, no pad needed. Copy loop uses mov_b [reg+reg*1] scaled indexing (proven at path.pdx / readdir.pdx / svc_broker.pdx) with an xor-pre-zeroed r8 scratch for the loaded byte. Shared by Walk::walk_pending_push (copy a live path pointer into a pending-worklist slot) and Walk::walk_pending_pop (copy a pending-worklist slot into cur_src_buf/cur_dst_buf) — both are the same 'NUL-terminated string into a fixed buffer' operation.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = dst_ptr
+        mov r12, rsi;                          // r12 = src_ptr
+
+        mov rdi, r12;
+        call walk_strlen;
+        mov r13, rax;                          // r13 = len
+
+        xor rcx, rcx;
+      wss_copy_top:
+        cmp rcx, r13;
+        jae wss_copy_done;
+        xor r8, r8;
+        mov_b r8, [r12 + rcx*1];
+        mov_b [rbx + rcx*1], r8;
+        add rcx, 1;
+        jmp wss_copy_top;
+      wss_copy_done:
+        xor r8, r8;
+        mov_b [rbx + r13*1], r8;               // NUL-terminate
+
+        mov rax, r13;                          // return len
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_path_join(out_ptr, base_ptr, base_len, name_ptr, name_len)
+  //
+  // Signature: walk_path_join : (u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI: out_ptr   — VA of a 256-byte destination buffer
+  // RSI: base_ptr  — VA of the NUL-terminated base directory path
+  // RDX: base_len  — strlen(base_ptr), clamped to <= 255 here defensively
+  // RCX: name_ptr  — VA of the (non-NUL-terminated) entry name bytes
+  // R8:  name_len  — byte length of the entry name
+  //
+  // Writes out_ptr = base_ptr[0..base_len) + '/' + name_ptr[0..name_len)
+  // + NUL, clipping name_len (never base_len, never the '/') if the
+  // total would exceed 255 chars + NUL — every write stays inside the
+  // 256-byte destination by construction (see the worked bound in the
+  // file-header PATH_MAX note). RAX is unused (void-shaped return).
+  //
+  // Non-leaf in spirit only (no calls); leaf in register-save terms —
+  // uses rdi/rsi/rdx/rcx/r8 (args, read-only after the base copy for
+  // rdi/rcx) plus r9/r10/r11 scratch. No callee-save touched.
+  // ============================================================================
+  pub let walk_path_join : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (out_ptr: u64) (base_ptr: u64) (base_len: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-003 Walk::walk_path_join. Builds out_ptr = base_ptr[0..base_len) + '/' + name_ptr[0..name_len) + NUL inside a 256-byte destination, clipping name_len (never base_len/the slash) so every store stays in [out_ptr, out_ptr+256). Defensive clamp `cmp rdx,255; jbe ok; mov rdx,255` handles a base_len a future caller might pass unclamped. Phase 1 copies min(base_len,255) bytes via mov_b [reg+reg*1] scaled indexing (proven at path.pdx/readdir.pdx/svc_broker.pdx). Phase 2 writes '/' at out[base_len] only if base_len < 255 (walk_join_no_room handles the base_len==255 pathological edge by NUL-terminating at out[255] with no slash/name — a single path component already at the system PATH_MAX). Phase 3 computes room = 255 - base_len - 1 for the name and clips name_len to it if needed, then copies via the same scaled-index idiom with the destination index recomputed per byte as base_len+1+j (r11 scratch, no persisted running pointer needed). Phase 4 NUL-terminates at base_len+1+clipped_name_len. Worked bound: base_len<=254 in the normal path (room>0 gate), so max byte index written is base_len+clipped_name_len <= 254, and the terminating NUL lands at <=255 — both in bounds for a 256-byte buffer. No callee-save touched; r9/r10/r11 scratch, rax unused.",
+      block: {
+        cmp rdx, 255;
+        jbe walk_join_base_len_ok;
+        mov rdx, 255;
+      walk_join_base_len_ok:
+
+        xor r10, r10;
+      walk_join_base_top:
+        cmp r10, rdx;
+        jae walk_join_base_done;
+        xor r9, r9;
+        mov_b r9, [rsi + r10*1];
+        mov_b [rdi + r10*1], r9;
+        add r10, 1;
+        jmp walk_join_base_top;
+      walk_join_base_done:
+
+        // room = 255 - base_len (>= 0). room == 0 means base_len == 255:
+        // no space even for the separating slash.
+        mov r11, 255;
+        sub r11, rdx;
+        cmp r11, 0;
+        je walk_join_no_room;
+
+        mov r9, 47;                            // '/'
+        mov_b [rdi + rdx*1], r9;
+
+        // room for the name itself = room - 1 (the slash consumed one).
+        sub r11, 1;
+        cmp r8, r11;
+        jbe walk_join_name_len_ok;
+        mov r8, r11;                           // clip name_len to available room
+      walk_join_name_len_ok:
+
+        xor r10, r10;
+      walk_join_name_top:
+        cmp r10, r8;
+        jae walk_join_name_done;
+        xor r9, r9;
+        mov_b r9, [rcx + r10*1];
+        mov r11, rdx;
+        add r11, 1;
+        add r11, r10;                          // dest index = base_len + 1 + j
+        mov_b [rdi + r11*1], r9;
+        add r10, 1;
+        jmp walk_join_name_top;
+      walk_join_name_done:
+        mov r11, rdx;
+        add r11, 1;
+        add r11, r8;                           // dest index = base_len + 1 + name_len
+        xor r9, r9;
+        mov_b [rdi + r11*1], r9;               // NUL-terminate
+
+        xor rax, rax;
+        ret
+
+      walk_join_no_room:
+        mov r11, 255;
+        xor r9, r9;
+        mov_b [rdi + r11*1], r9;               // truncated NUL-terminated string
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_pending_push(src_ptr, dst_ptr) -> rc
+  //
+  // Signature: walk_pending_push : (u64, u64) -> u64 !{mem} @{}
+  // RAX (output): 0 (pushed) or 1 (worklist full — MAX_PENDING_DIRS reached)
+  //
+  // Appends (src_ptr, dst_ptr) to the pending-directory worklist.
+  // src_ptr/dst_ptr may point at entry_src_scratch/entry_dst_scratch
+  // (transient) or the original argv pointers (the root seed) — both
+  // are copied into the pending arrays via walk_str_store, so the
+  // caller's buffer does not need to survive past this call.
+  //
+  // Non-leaf (two walk_str_store calls). 3-push prologue (rbx=src_ptr,
+  // r12=dst_ptr, r13=pending_count) — same alignment arithmetic as
+  // walk_str_store (entry rsp%16==8, three pushes -> 0, no pad).
+  // ============================================================================
+  pub let walk_pending_push : (u64, u64) -> u64 !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-003 Walk::walk_pending_push. Appends (src_ptr, dst_ptr) to the bounded pending-directory worklist (MAX_PENDING_DIRS=128 slots of 256 bytes each in pending_src_paths/pending_dst_paths). 3-push prologue (rbx=src_ptr, r12=dst_ptr, r13=pending_count, all preserved across the two walk_str_store calls) — same 8->0->8->0 arithmetic as walk_str_store, no pad. Byte offset of slot i is i*256, computed via `shl rax,8` (power-of-two multiply, avoids needing an imul/mul instruction) rather than a real multiply. rax is recomputed via `mov rax,r13; shl rax,8` before EACH of the two writes because the intervening walk_str_store call clobbers rax as its own return value (r13 is callee-save and survives the call, so recomputing from it is cheap and correct). On success bumps pending_count and returns 0; if pending_count is already at MAX_PENDING_DIRS returns 1 without writing anything (caller — Walk::walk_recursive — treats 1 as a fatal 'worklist full' condition and aborts the whole cp -r under the outer TXN rather than silently dropping the subtree, matching this round's fail-loud mandate).",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        push r13;                              // rsp%16: 8 → 0
+
+        mov rbx, rdi;                          // rbx = src_ptr
+        mov r12, rsi;                          // r12 = dst_ptr
+
+        lea r11, [rip + pending_count];
+        mov r13, [r11];                        // r13 = pending_count
+
+        cmp r13, 128;                          // MAX_PENDING_DIRS
+        jae wpp_full;
+
+        mov rax, r13;
+        shl rax, 8;                            // *256
+
+        lea rdi, [rip + pending_src_paths];
+        add rdi, rax;
+        mov rsi, rbx;
+        call walk_str_store;
+
+        mov rax, r13;                          // recompute (call clobbered rax)
+        shl rax, 8;
+
+        lea rdi, [rip + pending_dst_paths];
+        add rdi, rax;
+        mov rsi, r12;
+        call walk_str_store;
+
+        lea r11, [rip + pending_count];
+        mov rax, r13;
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // pushed OK
+        jmp wpp_epilogue;
+
+      wpp_full:
+        mov rax, 1;                            // worklist full
+
+      wpp_epilogue:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // walk_pending_pop()
+  //
+  // Signature: walk_pending_pop : () -> () !{mem} @{}
+  //
+  // Precondition: caller has checked pending_count > 0. Decrements
+  // pending_count, then copies that slot's src/dst paths into
+  // cur_src_buf/cur_dst_buf (and their strlen into cur_src_len/
+  // cur_dst_len) via walk_str_store. Copying out — rather than
+  // handing back a pointer into the pending array — means a
+  // subsequent walk_pending_push during this directory's processing
+  // is free to reuse that same slot index without corrupting the
+  // directory currently being walked.
+  //
+  // Non-leaf (two walk_str_store calls). 1-push prologue (rbx=slot
+  // index, preserved across both calls).
+  // ============================================================================
+  pub let walk_pending_pop : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-003 Walk::walk_pending_pop. Pops the top of the pending-directory worklist into cur_src_buf/cur_dst_buf (+ cur_src_len/cur_dst_len). 1-push prologue (rbx=slot index, preserved across the two walk_str_store calls) — entry rsp%16==8, one push lands rsp%16==0, matching CopyFile::copy_single_file's proven single-push alignment shape. Copies OUT of the pending array (via walk_str_store) rather than returning a pointer into it, specifically so that any walk_pending_push issued later while processing this directory's entries is free to reuse this exact slot index without clobbering the path this call just handed to the caller — this is what makes the explicit-worklist design safe without any additional bookkeeping. Precondition (checked by the caller, Walk::walk_recursive, via pending_count > 0) is not re-checked here.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+
+        lea r11, [rip + pending_count];
+        mov rax, [r11];
+        sub rax, 1;                            // idx = pending_count - 1
+        mov [r11], rax;
+        mov rbx, rax;                          // rbx = idx
+
+        mov rax, rbx;
+        shl rax, 8;                            // idx * 256
+        lea rdi, [rip + cur_src_buf];
+        lea rsi, [rip + pending_src_paths];
+        add rsi, rax;
+        call walk_str_store;
+        lea r11, [rip + cur_src_len];
+        mov [r11], rax;
+
+        mov rax, rbx;
+        shl rax, 8;
+        lea rdi, [rip + cur_dst_buf];
+        lea rsi, [rip + pending_dst_paths];
+        add rsi, rax;
+        call walk_str_store;
+        lea r11, [rip + cur_dst_len];
+        mov [r11], rax;
+
+        pop rbx;
         ret
       }
     }
@@ -141,36 +501,43 @@ module Walk = structure {
   // Signature: walk_recursive : (u64, u64) -> u64 !{mem, sysreg} @{}
   // RDI (input): src_ptr — VA of a NUL-terminated source directory path
   // RSI (input): dst_ptr — VA of a NUL-terminated destination directory path
-  // RAX (output): 0 on success, 1 on any syscall error
+  // RAX (output): 0 on success, 1 on any syscall error / worklist-full
   //
-  // Body flow (see file-header "Shape today" for the full narrative):
-  //   1. walk_reset
-  //   2. (optional verbose diagnostic on stderr)
-  //   3. pdxfs_mkdir(dst_ptr, 0o755)          → check negative errno
-  //   4. pdxfs_open(src_ptr, O_RDONLY = 0)    → r13 = fd_src_dir
-  //   5. Readdir loop:
-  //        pdxfs_readdir(fd, walk_entry_buf, WALK_ENTRY_BUF_LEN)
-  //        rax < 0 → readdir_fail
-  //        rax == 0 → walk_readdir_eof (done)
-  //        rax > 0 → walk_entry_todo (M2 dead code; parse entries)
-  //   6. pdxfs_close(fd_src_dir)
-  //   7. Return 0
+  // Flow: seed the pending worklist with the root (src, dst) pair,
+  // then loop: pop one pending directory, mkdir its destination, open
+  // its source, drain pdxfs_readdir into walk_entry_buf, and for each
+  // live entry (skipping "." / ".."): build the child src/dst paths,
+  // and either copy_bytes_only it (regular file / any non-directory
+  // type) or push it onto the pending worklist (directory) rather than
+  // recursing — see file-header note for why. Close the directory fd
+  // once its batch is drained, then pop the next pending directory (if
+  // any). Return 0 once the worklist is empty.
   //
-  // Register plan (5-push prologue → rsp%16 == 0 at nested calls):
-  //   rbx = src_ptr        (preserved across every call)
-  //   r12 = dst_ptr        (preserved across every call)
-  //   r13 = fd_src_dir     (from pdxfs_open; preserved across every call)
-  //   r14 = readdir return (bytes emitted into walk_entry_buf; needed
-  //                         inside the per-entry parse loop at M3+)
-  //   r15 = unused         (pushed for alignment parity with copy.pdx's
-  //                         5-push shape; reserved for M3's per-entry
-  //                         cursor into walk_entry_buf)
-  // Scratch: rax (return), rdi/rsi/rdx (syscall args), r11 (every lea).
+  // Register plan (5-push prologue → rsp%16 == 0 at every nested call):
+  //   rbx = fd_src_dir      (the directory currently open for readdir)
+  //   r12 = bytes_returned  (from the current pdxfs_readdir batch)
+  //   r13 = offset          (cursor into walk_entry_buf for this batch)
+  //   r14 = reserved        (holds the root src_ptr briefly at entry,
+  //                          unused for the rest of the function)
+  //   r15 = reserved        (holds the root dst_ptr briefly at entry,
+  //                          unused for the rest of the function)
+  // Everything else this function needs across a nested call
+  // (cur_src_buf/cur_dst_buf/cur_src_len/cur_dst_len, the pending
+  // arrays) lives in module .bss rather than a register, because only
+  // one directory is ever being processed at a time (see file-header
+  // note) — there is no reentrant second "instance" of walk_recursive
+  // whose state a register would need to be protected from.
+  //
+  // r8/r9/r10 (name_len / record ptr / type) are NEVER carried across
+  // a `call` in this function — every use recomputes them fresh from
+  // r13 (the offset, which IS callee-save and does survive calls)
+  // immediately after any intervening call, because r8-r11 are
+  // caller-save per SysV and this codebase's own convention.
   // ============================================================================
   pub let walk_recursive : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M2-001 Walk::walk_recursive. Recursive-shape entry point for `cp -r <src-dir> <dst-dir>`. 5-push prologue (rbx=src, r12=dst, r13=fd_src_dir, r14=readdir bytes, r15=unused reserved for M3 walk_entry_buf cursor) → rsp%16==0 at every nested call site. Body: mkdir dst (stubbed to 0); open src as dir; readdir loop (stubbed to 0=EOF, exits immediately); close dst_fd; return 0. Per-entry parse body (walk_entry_todo) is present in-line but unreachable today — Pdxfs::pdxfs_readdir returns 0 unconditionally. When R42 substrate lands the readdir call starts returning bytes-of-dirent-records and walk_entry_todo becomes the hot path; the M3 landing parses walk_entry_buf as an array of dirent records and, per entry, calls CopyFile::copy_bytes_only (regular file) or self-recurses (directory) on concatenated child paths. Verbose diagnostic (one line on stderr) fires at entry when CpFlags::flag_verbose_seen != 0. Error branches share a single walk_epilogue that pops all 5 callee-save regs; rax carries the exit code out. Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (0x1ED = 493 for 0o755 is the largest). Negative-errno detection uses cmp rax,0; jl (signed compare). sysreg effect declared for the syscall clobber shape.",
+      justification: "cp.ENH-002/ENH-003 Walk::walk_recursive REAL BODY. Replaces the M2-001 shape (mkdir stub always-succeed; readdir stub always-EOF; walk_entry_todo dead code) with a real explicit-worklist directory walk — see the file-header note for why self-recursion was rejected (walk_entry_buf reentrancy + the 16 KiB user-stack budget from EXECVE_USER_STACK_PAGES=4). 5-push prologue (rbx=fd_src_dir, r12=batch bytes_returned, r13=batch offset cursor, r14/r15=reserved, briefly holding the root src_ptr/dst_ptr across the walk_reset call before being hand off to walk_pending_push) lands rsp%16==0 at every nested call site, matching the original M2-001 shape. Flow: walk_reset (zeros counters + pending_count) -> walk_pending_push(root src,dst) -> walk_pop_top loop: if pending_count==0 done; else walk_pending_pop (fills cur_src_buf/cur_dst_buf/cur_src_len/cur_dst_len) -> optional verbose line -> pdxfs_mkdir(cur_dst_buf) -> pdxfs_open(cur_src_buf) as rbx -> readdir loop identical in shape to the original (bounds-check offset+12<=bytes, refill on exhaustion, name_len==0 terminator -> directory drained) -> per live entry: skip '.'/'..', walk_path_join both child paths into entry_src_scratch/entry_dst_scratch (r9/r8/r10 — record ptr/name_len/type — are recomputed fresh from r13 after EACH walk_path_join call since they are caller-save and the call clobbers them; r12/r13/rbx survive as callee-save) -> type==2(DIR): walk_pending_push the child pair (full worklist -> close fd, diagnostic, abort with exit 1); else: copy_bytes_only the child pair (which — per copy.pdx — already runs Undo::maybe_record_over_existing, SignedInode::preserve_at_destination, and CpPipe::cp_pipe_emit_progress internally, so no separate call site is needed here for any of the three) (failure -> close fd, abort with exit 1) -> advance offset by 12+name_len (name_len reloaded fresh, same caller-save reasoning) -> loop. On readdir drain (0 bytes or an in-batch terminator record), close fd and go back to walk_pop_top for the next pending directory. Every error branch (mkdir fail / open fail / readdir fail / worklist full / child fail) prints one diagnostic line and returns 1, which propagates to Dispatch::dispatch_copy's outer pdxfs_txn_abort — this is the fail-loud contract ENH-002 exists to establish (v1.0.0 silently returned 0 having copied nothing). Success returns 0 once the worklist empties. Every cmp reg,imm uses immediate <= 0x7FFFFFFF (largest: 4096 = WALK_ENTRY_BUF_LEN, 128 = MAX_PENDING_DIRS, 0x1ED=493 for 0o755). sysreg effect for the syscall clobber shape (pdxfs_mkdir/open/readdir/close are all real syscalls now per ENH-001).",
       block: {
         // ---- Prologue --------------------------------------------------------
         push rbx;                              // rsp%16: 8 → 0
@@ -179,107 +546,208 @@ module Walk = structure {
         push r14;                              // rsp%16: 0 → 8
         push r15;                              // rsp%16: 8 → 0
 
-        mov rbx, rdi;                          // rbx = src_ptr
-        mov r12, rsi;                          // r12 = dst_ptr
+        mov r14, rdi;                          // stash root src_ptr (briefly)
+        mov r15, rsi;                          // stash root dst_ptr (briefly)
 
-        // ---- Step 1: reset state --------------------------------------------
+        // ---- Step 1: reset state (counters + pending_count) -----------------
         call walk_reset;
 
-        // ---- Step 2: verbose diagnostic (optional) --------------------------
-        // Skip when flag_verbose_seen == 0. Reading the mirror slot
-        // rather than re-querying ParsedArgs keeps the fast-path free
-        // of the linear scan over flag_ids.
+        // ---- Step 2: seed the worklist with the root (src, dst) pair --------
+        mov rdi, r14;
+        mov rsi, r15;
+        call walk_pending_push;
+        cmp rax, 0;
+        jne walk_push_root_fail;               // MAX_PENDING_DIRS==0 (unreachable
+                                                // in practice; defensive only)
+
+        // ---- Step 3: main pop/process loop -----------------------------------
+      walk_pop_top:
+        lea r11, [rip + pending_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        je walk_all_done;
+
+        call walk_pending_pop;                 // fills cur_src_buf/cur_dst_buf(+len)
+
+        // Optional verbose diagnostic naming the directory now entered.
         lea r11, [rip + flag_verbose_seen];
         mov rax, [r11];
         cmp rax, 0;
         je walk_verbose_done;
-
         lea rdi, [rip + VERBOSE_ENTER_MSG];
         mov rsi, 22;                           // VERBOSE_ENTER_MSG_LEN
         call print_err;
-
       walk_verbose_done:
 
-        // ---- Step 3: mkdir destination (0o755 = 0x1ED) ----------------------
-        mov rdi, r12;                          // dst_ptr
-        mov rsi, 0x1ED;                        // 0o755 permission bits
+        // ---- mkdir(cur_dst_buf, 0o755) ---------------------------------------
+        lea rdi, [rip + cur_dst_buf];
+        mov rsi, 0x1ED;                        // 0o755
         call pdxfs_mkdir;
         cmp rax, 0;
         jl walk_mkdir_fail;
 
-        // ---- Step 4: open source directory (O_RDONLY = 0) -------------------
-        mov rdi, rbx;                          // src_ptr
+        // ---- open(cur_src_buf, O_RDONLY) --------------------------------------
+        lea rdi, [rip + cur_src_buf];
         mov rsi, 0;                            // O_RDONLY
         call pdxfs_open;
         cmp rax, 0;
         jl walk_open_srcdir_fail;
 
-        mov r13, rax;                          // r13 = fd_src_dir
+        mov rbx, rax;                          // rbx = fd_src_dir
         lea r11, [rip + fd_src_dir];
         mov [r11], rax;
 
-        // ---- Step 5: readdir loop -------------------------------------------
+        // ---- Readdir loop over the current directory --------------------------
       walk_readdir_head:
-        mov rdi, r13;                          // fd_src_dir
-        lea rsi, [rip + walk_entry_buf];       // buf
+        mov rdi, rbx;
+        lea rsi, [rip + walk_entry_buf];
         mov rdx, 4096;                         // WALK_ENTRY_BUF_LEN
         call pdxfs_readdir;
 
         cmp rax, 0;
-        jl walk_readdir_fail;                  // negative errno → error
-        je walk_readdir_eof;                   // 0 → end of directory
+        jl walk_readdir_fail;
+        je walk_dir_done;                      // 0 bytes -> directory drained
 
-        // rax > 0: entries returned. Fall through to walk_entry_todo.
-        mov r14, rax;                          // r14 = readdir bytes
+        mov r12, rax;                          // r12 = bytes_returned this batch
+        xor r13, r13;                          // r13 = offset := 0
 
-      walk_entry_todo:
-        // M2-001 dead code at runtime — Pdxfs::pdxfs_readdir stub
-        // returns 0 unconditionally so this block is unreachable today.
-        // At R42 substrate landing this block will parse walk_entry_buf
-        // as an array of dirent records and, per entry:
-        //   - Concatenate: entry_src = rbx + "/" + entry.name
-        //   - Concatenate: entry_dst = r12 + "/" + entry.name
-        //   - Bump entries_visited counter
-        //   - If entry.type == regular file:
-        //       call CopyFile::copy_bytes_only(entry_src, entry_dst)
-        //       call SignedInode::preserve_at_destination
-        //             (cap-tail re-sign per M2-002; graceful degrade
-        //              per M2-003)
-        //       call CpPipe::cp_pipe_emit_progress(entry_src, entry_dst,
-        //             CopyFile::bytes_copied, CopyFile::bytes_copied)
-        //             (M3-001 per-entry emission — record shape
-        //              identical to CopyFile::copy_bytes_only's
-        //              single-file emit)
-        //   - Else if entry.type == directory:
-        //       call Walk::walk_recursive(entry_src, entry_dst)  [self-recursion]
-        //   - Else (symlink, device, socket, etc.):
-        //       skip with a --verbose diagnostic
-        // Then jump back to walk_readdir_head for the next batch.
-        //
-        // For today, immediately loop back — the stub means we never
-        // arrive here, but if the stub ever returned a positive value
-        // by accident we would spin forever without this jump. Keeping
-        // it as an explicit jump makes that failure mode observable
-        // rather than silent.
-        jmp walk_readdir_head;
+      walk_entry_top:
+        mov rcx, r13;
+        add rcx, 12;                           // GETDENTS_HEADER_SIZE
+        cmp rcx, r12;
+        ja walk_readdir_head;                  // insufficient room -> refill
 
-        // ---- Success epilogue: close fd, return 0 ---------------------------
-      walk_readdir_eof:
-        mov rdi, r13;
+        lea r9, [rip + walk_entry_buf];
+        add r9, r13;                           // r9 = record ptr
+
+        xor r8, r8;
+        mov_w r8, [r9 + 8];                    // r8 = name_len (u16, zero-ext)
+        cmp r8, 0;
+        je walk_dir_done;                      // terminator record -> drained
+
+        xor r10, r10;
+        mov_b r10, [r9 + 10];                  // r10 = type (1=REG, 2=DIR)
+
+        // ---- Skip "." pseudo-entry --------------------------------------------
+        cmp r8, 1;
+        jne walk_entry_check_dotdot;
+        mov_b rax, [r9 + 12];
+        cmp rax, 46;                           // '.'
+        je walk_entry_advance;
+
+        // ---- Skip ".." pseudo-entry --------------------------------------------
+      walk_entry_check_dotdot:
+        cmp r8, 2;
+        jne walk_entry_build_src;
+        mov_b rax, [r9 + 12];
+        cmp rax, 46;
+        jne walk_entry_build_src;
+        mov_b rax, [r9 + 13];
+        cmp rax, 46;
+        jne walk_entry_build_src;
+        jmp walk_entry_advance;
+
+        // ---- Build child_src = cur_src_buf + "/" + name -----------------------
+      walk_entry_build_src:
+        lea rdi, [rip + entry_src_scratch];    // out_ptr
+        lea rsi, [rip + cur_src_buf];          // base_ptr
+        lea r11, [rip + cur_src_len];
+        mov rdx, [r11];                        // base_len
+        mov rcx, r9;
+        add rcx, 12;                           // name_ptr
+        // r8 (name_len) is already live from above; untouched so far.
+        call walk_path_join;
+
+        // r8/r9/r10 are caller-save and the call above clobbered them —
+        // recompute the record ptr + reload name_len + type fresh.
+        lea r9, [rip + walk_entry_buf];
+        add r9, r13;
+        xor r8, r8;
+        mov_w r8, [r9 + 8];
+
+        // ---- Build child_dst = cur_dst_buf + "/" + name -----------------------
+        lea rdi, [rip + entry_dst_scratch];
+        lea rsi, [rip + cur_dst_buf];
+        lea r11, [rip + cur_dst_len];
+        mov rdx, [r11];
+        mov rcx, r9;
+        add rcx, 12;
+        call walk_path_join;
+
+        // Reload type fresh for the dispatch decision below.
+        lea r9, [rip + walk_entry_buf];
+        add r9, r13;
+        xor r10, r10;
+        mov_b r10, [r9 + 10];
+
+        cmp r10, 2;                            // VNODE_TYPE_DIR
+        je walk_entry_recurse;
+
+        // ---- Regular file (or any non-directory type): copy now ---------------
+        lea rdi, [rip + entry_src_scratch];
+        lea rsi, [rip + entry_dst_scratch];
+        call copy_bytes_only;
+        cmp rax, 0;
+        jne walk_entry_child_fail;
+        jmp walk_entry_advance;
+
+        // ---- Directory: push onto the pending worklist -------------------------
+      walk_entry_recurse:
+        lea rdi, [rip + entry_src_scratch];
+        lea rsi, [rip + entry_dst_scratch];
+        call walk_pending_push;
+        cmp rax, 0;
+        jne walk_entry_pending_full;
+
+        // ---- Advance to the next record in this batch --------------------------
+      walk_entry_advance:
+        lea r11, [rip + entries_visited];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Recompute record ptr + reload name_len fresh (any call above
+        // may have clobbered r8/r9) and advance the offset cursor.
+        lea r9, [rip + walk_entry_buf];
+        add r9, r13;
+        xor r8, r8;
+        mov_w r8, [r9 + 8];
+        add r13, 12;
+        add r13, r8;
+        jmp walk_entry_top;
+
+        // ---- Directory fully drained: close fd, pop next pending dir -----------
+      walk_dir_done:
+        mov rdi, rbx;
         call pdxfs_close;
+        jmp walk_pop_top;
 
+        // ---- Worklist empty: overall success ------------------------------------
+      walk_all_done:
         xor rax, rax;                          // EXIT_OK (0)
         jmp walk_epilogue;
 
         // ---- Error branches -------------------------------------------------
-        // Ordered by "how many fds are open":
-        //   0 fds: walk_mkdir_fail, walk_open_srcdir_fail
-        //   1 fd  (fd_src_dir): walk_readdir_fail
+      walk_entry_child_fail:
+        mov rdi, rbx;
+        call pdxfs_close;
+        mov rax, 1;
+        jmp walk_epilogue;
+
+      walk_entry_pending_full:
+        mov rdi, rbx;
+        call pdxfs_close;
+        lea rdi, [rip + PENDING_FULL_MSG];
+        mov rsi, 52;                           // PENDING_FULL_MSG_LEN
+        call print_err;
+        mov rax, 1;
+        jmp walk_epilogue;
+
       walk_mkdir_fail:
         lea rdi, [rip + MKDIR_FAIL_MSG];
         mov rsi, 31;                           // MKDIR_FAIL_MSG_LEN
         call print_err;
-        mov rax, 1;                            // EXIT_OP_FAIL
+        mov rax, 1;
         jmp walk_epilogue;
 
       walk_open_srcdir_fail:
@@ -290,12 +758,15 @@ module Walk = structure {
         jmp walk_epilogue;
 
       walk_readdir_fail:
-        mov rdi, r13;
+        mov rdi, rbx;
         call pdxfs_close;
-
         lea rdi, [rip + READDIR_FAIL_MSG];
         mov rsi, 30;                           // READDIR_FAIL_MSG_LEN
         call print_err;
+        mov rax, 1;
+        jmp walk_epilogue;
+
+      walk_push_root_fail:
         mov rax, 1;
         jmp walk_epilogue;
 

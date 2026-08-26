@@ -21,7 +21,7 @@
 name        = cp
 version     = 1.0.0
 kind        = tool
-entry       = CpMain::cp_main
+entry       = Main::cp_main
 output      = build-out/cp
 caps_decl   = caps.decl
 sig_file    = manifest.pdxsig

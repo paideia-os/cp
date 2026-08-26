@@ -116,11 +116,15 @@ module Elevate = structure {
   pub let mut elevate_ok      : u64 = uninit @align(8)  // ELVC_OK returns
   pub let mut elevate_refused : u64 = uninit @align(8)  // STUB + errors
 
-  // -- Diagnostic string for the log-and-continue path. Unused at M3
-  // -- (call site does not print); reserved for the M4 verbose surface.
-  pub let ELEVATE_REFUSED_MSG : [u8; 45] =
+  // -- Diagnostic string emitted by CopyFile::copy_bytes_only's
+  // -- copy_open_dst_cap_denied branch (cp.ENH-012) on a real elevate
+  // -- refusal. Array size + LEN corrected to 46 (cp.ENH-012 audit —
+  // -- was declared 45, one byte short of the actual 46-byte literal;
+  // -- harmless while unused, but this landing is the first real call
+  // -- site so it must be exact).
+  pub let ELEVATE_REFUSED_MSG : [u8; 46] =
     "cp: elevate refused (dst-parent out of scope)\n"
-  pub let ELEVATE_REFUSED_MSG_LEN : u64 = 45
+  pub let ELEVATE_REFUSED_MSG_LEN : u64 = 46
 
   // ============================================================================
   // cp_elevate_reset()

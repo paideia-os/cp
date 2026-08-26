@@ -15,13 +15,16 @@
 @doc-format-version 1
 @tool cp
 @version 1.0.0
-@one-liner Copy a file or a directory tree in one atomic PdxFS transaction.
+@one-liner Copy a file or a directory tree, with per-file cap re-signing.
 
 @section 1. Name
 
 @para
-cp — copy a file or a directory tree, atomically, with per-file
-capability re-signing and a PdxFS undo record on overwrite.
+cp — copy a file or a directory tree, with per-file capability
+re-signing. cp is WIRED for single-invocation transactional
+atomicity and a PdxFS undo record on overwrite, but neither
+guarantee is real yet — see §3 for exactly which kernel syscalls are
+still missing.
 
 @section 2. Synopsis
 
@@ -38,12 +41,20 @@ the destination is the parent directory of the target tree. When
 @section 3. Description
 
 @para
-cp copies bytes from `<src>` to `<dst>` under a single PdxFS
-transaction: every write is either fully visible at the destination
-or fully rolled back. Partial-copy states are not visible to any
-concurrent reader; a mid-copy crash or a mid-copy signal that ends
-the process leaves the destination byte-identical to its pre-copy
-state.
+cp wraps the whole invocation (single-file, or every entry of a
+`cp -r` tree) in one `pdxfs_txn_begin` / `pdxfs_txn_commit` /
+`pdxfs_txn_abort` triple, and every failure inside the copy or walk
+body routes through the abort call before cp exits. This is the
+INTENDED atomicity design — the wiring is real — but as of this
+writing the paideia-os kernel exposes only `sys_pdxfs_txn_open`
+(sysno 70); no commit/abort syscall ordinal is exposed yet, so all
+three trampolines are still no-op stubs (`pdxfs_txn_begin` /
+`_commit` return 0 unconditionally; `pdxfs_txn_abort` likewise).
+**The atomicity guarantee is therefore not real yet**: a mid-copy
+crash today leaves whatever bytes had already been written, exactly
+like a copy with no transaction at all. This is a tracked paideia-os
+kernel dependency (not a cp defect) — cp is a body-edit away from the
+real guarantee the day `sys_pdxfs_txn_commit` / `_abort` land.
 
 @para
 Every cp invocation also (a) journals a `CopyRecord` to the audit
@@ -51,21 +62,29 @@ log before writing any bytes (D3 audit-first — the record is
 present even on failure), (b) emits `CopyProgressRecord[]` on its
 stdout fd bound to schema `CopyProgressRecord@0.1` (D2 semantic
 pipes — downstream `query`, `sort`, `pipeviz` consume the typed
-records without column-slicing text), and (c) attempts to re-sign
-the destination inode's cap tail under the invoker's `user_sk`
-so ownership provenance survives the copy (`design/user/model.md`
-§10.2 signed-inode field). When the invoker's key is locked or
-the copy crosses user boundaries, the re-sign gracefully degrades;
-the file bytes still land and `--verbose` emits a one-line
-diagnostic naming the degrade cause.
+records without column-slicing text) for every file copied,
+whether via a plain `cp` or via `cp -r`'s per-entry walk, and
+(c) attempts to re-sign the destination inode's cap tail under
+the invoker's `user_sk` so ownership provenance survives the copy
+(`design/user/model.md` §10.2 signed-inode field). When the
+invoker's key is locked or the copy crosses user boundaries, the
+re-sign gracefully degrades; the file bytes still land and
+`--verbose` emits a one-line diagnostic naming the degrade cause.
 
 @para
-When `--over-existing` is present and the destination already
-exists, cp writes a PdxFS v1 undo record before overwriting so
-`undo cp <same-args>` restores the pre-copy destination bytes.
-Without `--over-existing`, an existing destination is treated as
-an error (exit 1) — this differs from POSIX cp which silently
-overwrites by default.
+cp always opens the destination `O_WRONLY | O_CREAT | O_TRUNC` and
+overwrites an existing destination unconditionally — this matches
+POSIX cp's default-overwrite behavior; cp does NOT refuse an
+existing destination. `--over-existing` does not gate the write;
+it additionally attempts to journal a PdxFS v1 undo record of the
+pre-copy destination bytes before the overwrite so `undo cp
+<same-args>` can restore them. As of this writing the kernel-side
+`sys_pdxfs_undo_write` syscall the journal write needs is not yet
+exposed (tracked as a paideia-os dependency, not a cp defect), so
+`--over-existing` currently gates correctly (it detects whether the
+destination exists) but does not yet persist a real undo record —
+`undo cp <same-args>` will not restore anything until that syscall
+lands.
 
 @section 4. Options
 
@@ -73,36 +92,56 @@ overwrites by default.
 
 @example
 -r                    Recursively copy a directory tree.
--v                    Emit CopyProgressRecord[] per file on stdout.
---dry-run             Preview the copy without writing to dst.
---over-existing       Write undo record before overwriting.
+-v                    Additional stderr diagnostics only (per-directory
+                      enter notice, cap-tail degrade cause). Does NOT
+                      gate CopyProgressRecord[] emission — every copied
+                      file emits a record regardless of -v.
+--dry-run             Exit before opening the transaction or touching
+                      src/dst at all; prints one confirmation line.
+                      Does not enumerate the files/bytes that would be
+                      copied (no dry walk is performed).
+--over-existing       Attempt an undo-record write before overwriting
+                      an existing destination (see §3 for the current
+                      substrate-blocked state of the actual journal
+                      write).
 
 @subsection 4.2 Standard flag vocabulary (I3)
 
 @example
 --help                Render this document via `doc cp`.
---version             Print `cp 1.0.0 (build <hash>) sig <fingerprint>`.
---json                Emit CopyProgressRecord[] as JSON.
---schema              Print CopyProgressRecord schema and exit.
---verbose             Additional diagnostics on stderr (audit ids).
---quiet               Suppress non-error diagnostics.
+--version             Parsed by libpdx-argv's standard vocabulary; no
+                      version string is compiled into cp yet, so this
+                      flag has no observable effect at 1.0.x.
+--json                Parsed; no JSON-emission code path exists yet.
+--schema              Parsed; no schema-print code path exists yet.
+--verbose             Same flag as `-v` above (short/long alias fold
+                      into one mirror bit).
+--quiet               Parsed into ParsedArgs; cp never reads it back —
+                      `--quiet` currently has no effect.
 --no-cap:<name>       Drop the named cap before exec (per D5).
 --pdx-schema          Set emit_schema=1 in ParsedArgs.
 
 @section 5. Exit codes
 
 @example
-0    success.
-1    operation failed (open/read/write error, short write).
+0    success (including a --dry-run invocation and a fully-drained
+     `cp -r`).
+1    operation failed: open/read/write error, short write, mkdir
+     failure, readdir failure, source == destination (or destination
+     nested under source), or the recursive worklist filling up
+     (bounded at 128 pending subdirectories at once).
 2    usage error (parse fail, wrong positional count).
-3    recognised shape, body not yet implemented (see M-diff).
-4    cap denied (elevate refused, cross-user preservation locked).
+3    reserved; no code path returns it as of this writing.
+4    cap denied — the elevate broker refused (or was unreachable) when
+     cp retried a destination-parent open after the first attempt
+     failed.
 
 @para
-Code 3 is a bootstrap-era reservation — it names an argv shape the
-parser accepts but the milestone body does not yet implement. At
-1.0, `-r` at pos_count > 2 is the last surviving exit-3 site;
-every other flag body is wired.
+Code 3 was a bootstrap-era reservation for "argv shape accepted,
+milestone body not yet wired". Every flag shape cp accepts now has a
+real body (including `-r`, which lands a full directory-tree walk —
+see §3), so no code path assigns exit 3 today; it remains reserved
+for a future not-yet-implemented flag rather than removed outright.
 
 @section 6. Capabilities required
 
@@ -121,24 +160,30 @@ KIND_PDXFS_FILE        (write, <dst-parent>)
 KIND_PDXFS_TXN         (invoke)
 
 @para
-Cross-subtree destinations trigger a KIND_ELEVATE_CHANNEL request
-at M3-003. The request specifies the widened `KIND_PDXFS_FILE
-(write, <dst-parent>)` cap; the approver hop returns either a
-widened cap (auto-approve or human-approve OK) or a refuse. On
-refuse, cp exits 4 with a stderr diagnostic naming the missing
-cap. cp never opens a broker hop the substrate does not yet expose —
-if the elevate broker is unreachable, cp exits 4 with a distinct
-diagnostic.
+cp retries via a KIND_ELEVATE_CHANNEL request on EVERY destination
+open failure (M3 does not yet distinguish "cross-subtree" from any
+other open-failure cause). The request specifies the widened
+`KIND_PDXFS_FILE (write, <dst-parent>)` cap. libpdx-elevate.M1 has no
+broker daemon running yet, so at 1.0.x this retry is always refused
+— every elevate attempt today ends in `cp: elevate refused
+(dst-parent out of scope)` and exit 4, whether the real cause would
+have been "refused" or "broker unreachable"; the two are not yet
+distinguishable at cp's level.
 
 @section 7. Output schemas
 
 @para
 cp binds fd 1 (stdout) to `CopyProgressRecord@0.1` at
-`main.pdx::cp_main` before dispatching. Every successful per-file
-copy emits one record naming the source path, destination path,
-byte count copied, elapsed wall-clock, and the cap-tail preserve
-outcome (OK / DEGRADED_KEY_LOCKED / DEGRADED_CROSS_USER).
-Downstream:
+`Main::cp_main` before dispatching. Every successful per-file copy —
+single-file or one entry of a `cp -r` walk — emits one record: source
+path, destination path, bytes_copied, and bytes_total (bytes_total
+equals bytes_copied at 1.0.x; a distinct total arrives once
+`pdxfs_stat` is read before the copy starts, not only for
+`--over-existing`). `elapsed_ns` is present in the record shape but
+is a hardcoded 0 at 1.0.x — wall-clock timing is not wired yet. There
+is no cap-tail-preserve-outcome field in the record; the preserve
+outcome is only ever visible via a `--verbose` stderr line, never on
+the structured stdout stream. Downstream:
 
 @example
 $ cp -r /src/tree /dst/tree | query 'select path where bytes > 1M'
@@ -153,31 +198,40 @@ inspection.
 @section 8. Audit + undo
 
 @para
-Every cp invocation writes an audit record to `/system/audit/user-
-events/` before it writes any bytes. On success the record is
-sealed with the outcome (bytes copied, elapsed) at commit time. On
-failure the seal contains the failure code and the partial state
-was rolled back at the TXN boundary — the audit log names the
-attempt even when nothing landed.
+Every cp invocation writes an audit record via libpdx-audit before
+it writes any bytes (`audit_begin`) and seals it with the exit code
+at commit time (`audit_commit`) — the audit log names the attempt
+even when nothing landed. The "partial state rolled back at the TXN
+boundary" part of that seal is aspirational until the kernel-side
+TXN commit/abort syscalls land (see §3) — today the TXN wrap runs
+but the rollback it wraps around is a no-op.
 
 @para
-`--over-existing` additionally writes a PdxFS v1 undo record to the
-destination's parent subtree. `undo cp <same-args>` walks the undo
-graph and restores the pre-copy destination bytes. Multi-file
-recursive copies write one undo record per over-written destination;
-`undo` replays them in reverse order.
+`--over-existing` correctly detects (via a real `pdxfs_stat` call,
+per §3) whether the destination already exists, but the PdxFS v1
+undo-journal WRITE itself (`sys_pdxfs_undo_write`) is not yet exposed
+by the kernel — this is the one piece of the M2-005 design that
+remains a stub. `undo cp <same-args>` therefore has nothing to
+replay yet: no undo record is actually persisted. Multi-file
+recursive copies will write one undo record per over-written
+destination once the syscall lands; `undo` will then replay them in
+reverse order.
 
 @section 9. POSIX differences
 
 @posix-diff
-POSIX cp overwrites existing destinations by default; paideia-os
-cp refuses (exit 1) unless `--over-existing` is present.
+None here at 1.0.x — paideia-os cp overwrites an existing
+destination unconditionally, same as POSIX cp's default. (An earlier
+draft of this document claimed paideia-os cp refuses an existing
+destination without `--over-existing`; no code path has ever done
+that — see §3.)
 
 @posix-diff
 POSIX cp emits no output on success; paideia-os cp emits
 CopyProgressRecord[] on stdout (empty when the source is empty).
-`--quiet` suppresses the records for POSIX-shell scripts that
-expected silence.
+`--quiet` is parsed but not yet wired to suppress them — a
+POSIX-shell script expecting silence on cp's stdout should redirect
+it explicitly until `--quiet` lands.
 
 @posix-diff
 POSIX cp does not journal to an audit log; paideia-os cp writes
@@ -190,8 +244,8 @@ travels with the file.
 
 @posix-diff
 POSIX cp exit codes are 0 / >0; paideia-os cp distinguishes usage
-(2), not-yet-implemented (3), and cap-denied (4) so scripts can
-branch on the cause.
+(2) and cap-denied (4) so scripts can branch on the cause. Exit 3 is
+reserved (see §5) but not returned by any code path at 1.0.x.
 
 @section 10. Examples
 
@@ -206,26 +260,42 @@ $ echo $?
 $ cp -r /src/photos /backup/photos | query 'where bytes > 4M'
 
 @example
-# Overwrite an existing destination with a rollback point.
+# Overwrite an existing destination. --over-existing is accepted and
+# correctly detects the pre-existing file, but does not yet persist a
+# real undo record (sys_pdxfs_undo_write is not exposed — see §8), so
+# `undo cp` has nothing to replay at 1.0.x.
 $ cp --over-existing /new/config /etc/paideia/config
-$ undo cp --over-existing /new/config /etc/paideia/config
-$ diff /etc/paideia/config /old/config    # matches; undo restored it.
+$ echo $?
+0
 
 @example
-# Preview without touching the destination.
+# Preview: guarantees no bytes move, but does not enumerate files.
 $ cp --dry-run -r /src /dst
-cp: would copy 214 files (127.4 MiB) into /dst
+cp: dry run: no changes made
+$ echo $?
+0
 
 @example
-# Cross-subtree destination — elevate hop.
-$ cp report.pdf /srv/shared/2026/
-cp: requesting KIND_PDXFS_FILE(write, /srv/shared/2026/) via elevate...
-cp: approved (auto-policy: /srv/shared/**/ writable by user alice).
+# Refused: destination nested under source (cp.ENH-008).
+$ cp -r /src /src/sub
+cp: source and destination refer to the same path
+$ echo $?
+1
 
 @example
-# Cross-user copy — signed-inode degrades, bytes still land.
-$ cp -v /home/alice/report.pdf /home/bob/inbox/report.pdf
-cp: cap-tail preserve DEGRADED_CROSS_USER (destination unsigned).
+# Cross-subtree destination — elevate hop refused (no broker daemon
+# running yet at 1.0.x, so every elevate attempt is currently refused).
+$ cp report.pdf /srv/shared/2026/report.pdf
+cp: elevate refused (dst-parent out of scope)
+$ echo $?
+4
+
+@example
+# Cap-tail re-sign degrades (invoker's key locked); bytes still land.
+$ cp -v report.pdf /home/bob/inbox/report.pdf
+cp: destination cap-tail unsigned (key locked)
+$ echo $?
+0
 
 @section 11. Files
 
@@ -248,7 +318,11 @@ tests/*.md             Test-spec matrices (18 rows across 3 files).
 @xref query            Consumes CopyProgressRecord[] on stdin.
 @xref libpdx-audit     Provides audit_begin / audit_commit.
 @xref libpdx-elevate   Provides the cross-subtree cap-widening hop.
-@xref libpdx-cap       Provides signed-inode preservation helpers.
+@xref libpdx-cap       Signed-inode preservation is hand-rolled in
+                       src/signed_inode.pdx today, not yet delegated
+                       to libpdx-cap; listed here as the intended
+                       eventual provider, not a current dependency
+                       (manifest.pdxproj carries no libpdx-cap dep).
 
 @section 13. See also
 
@@ -262,9 +336,10 @@ milestone plan) — all in the paideia-os repo.
 
 @para
 File issues at `https://github.com/paideia-os/cp/issues`. Include
-the invocation, the `cp --version` output (build hash + signature
-fingerprint), and the audit record id (rendered by cp `--verbose`
-on stderr) so the audit log is queryable during triage.
+the exact invocation and argv, and (if `--verbose` was passed) any
+stderr diagnostic line it printed. `--version` does not print a
+build hash or signature fingerprint at 1.0.x (see §4.2) — quote the
+tag/commit you built from instead.
 
 @section 15. Author
 

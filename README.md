@@ -67,16 +67,45 @@ journal). Only when both pass does it call the PdxFS v1 journal write.
 calls `CpAudit::cp_audit_begin_wrap` at its very top, before the
 positional-count gate that can print to stderr, so the invoke record
 lands before any user-visible output; `cp_audit_commit_wrap(exit_code)`
-fires at the shared epilogue on every exit path. Two substrate gates are
-open at 1.0 and are worth knowing before relying on reversibility:
-`sys_pdxfs_undo_write` is not yet exposed, so `undo_journal_write_stub`
-returns `UNDO_OK` without writing; and `pdxfs_stat` is an M2 stub that
-returns `-2` (ENOENT) unconditionally, so the second undo gate never
-passes today and `--over-existing` performs the copy but journals no undo
-record. Both are body-edit landing sites awaiting the paideia-os R42
-substrate expansion — the call shapes are wired end to end. Likewise the
+fires at the shared epilogue on every exit path. One substrate gate
+remains open post-1.0 and is worth knowing before relying on
+reversibility: `pdxfs_stat` is now real (flipped to syscall 77 — the
+R56.M3-002 VFS-metadata substrate landed after v1.0.0 shipped), so the
+undo gate correctly detects an existing destination; but
+`sys_pdxfs_undo_write` is still not exposed by the kernel, so
+`undo_journal_write_stub` bumps a counter and returns `UNDO_OK` without
+ever writing a real journal record — `--over-existing` performs the
+copy and correctly *decides* whether it should journal, but does not
+yet persist anything for `undo cp` to replay. This is a tracked
+paideia-os kernel dependency, not a cp defect. Likewise the
 libpdx-audit broker is a stub, so audit records are shaped but not yet
 durably journaled.
+
+**Recursive walk (`-r`).** `Walk::walk_recursive` performs a real
+directory-tree walk: `pdxfs_mkdir`/`pdxfs_readdir` are real syscalls
+(79/78, same R56.M3 landing) rather than the v1.0.0 always-succeed /
+always-EOF stubs that made `cp -r src dst` exit 0 having copied
+nothing. It does **not** self-recurse per subdirectory — an explicit
+bounded worklist (`Walk::pending_*`, capped at 128 simultaneously
+queued subdirectories) avoids both reusing the single shared readdir
+buffer reentrantly and growing the call stack with tree depth (the
+process's user stack is 4 pages / 16 KiB per
+`EXECVE_USER_STACK_PAGES`). `.`/`..` entries are skipped; every other
+entry is either copied via `copy_bytes_only` (which already runs the
+cap-tail preserve, undo-gate, and progress-emit hooks — no separate
+call site is needed per recursive entry) or queued if it is itself a
+directory. A worklist overflow, an mkdir/open/readdir failure, or a
+child copy/recurse failure all abort the whole `cp -r` (exit 1) under
+the same outer TXN as the single-file path.
+
+**Same-path / nested-destination gate.** `Dispatch::dispatch_paths_
+conflict` runs before the TXN opens: it refuses `src == dst` (byte-
+identical paths — `cp a a` used to open the same vnode read-only and
+write-with-create-and-no-truncate simultaneously, silently) and
+refuses a destination nested directly under the source (`cp -r a
+a/sub`, which would otherwise recurse into a destination tree that
+keeps growing under the source it is being copied from). Both exit 1
+with `cp: source and destination refer to the same path`.
 
 ## Options
 
@@ -92,7 +121,7 @@ every downstream module reads.
 | `-v` | `CP_ID_VERBOSE` = 101 | none | off | Enable the two stderr diagnostics gated on `flag_verbose_seen`: `cp: -r walk entering` at walk entry, and `cp: destination cap-tail unsigned (key locked)` on signed-inode degrade. Does **not** gate the progress records — those emit unconditionally. |
 | `--verbose` | `STD_ID_VERBOSE` = 6 | none | off | Long alias for `-v`. `populate` ORs both seen-bits into `flag_verbose_seen`, so the two forms are indistinguishable downstream. |
 | `--over-existing` | `CP_ID_OVER_EXISTING` = 102 | none | off | Arm the undo-record gate: write a PdxFS v1 undo record before overwriting an existing destination. See [Audit records](#audit-records). |
-| `--dry-run` | `STD_ID_DRY_RUN` = 3 | none | off | *(implemented: parser only — `CpFlags::populate` fills `flag_dry_run` / `flag_dry_run_seen`, but no module in `src/` reads either slot.)* |
+| `--dry-run` | `STD_ID_DRY_RUN` = 3 | none | off | `dispatch_copy` checks `flag_dry_run_seen` before opening the TXN or calling the copy/walk body; on a dry run it prints `cp: dry run: no changes made` and exits 0 without touching src or dst. Does not enumerate the files/bytes that would be copied. |
 
 The remaining `StdVocab` flags (`--help`, `--version`, `--json`,
 `--schema`, `--quiet`, `--color`, `--no-cap`, `--pdx-schema`) are
@@ -100,10 +129,16 @@ registered by `StdVocab::register_all` and therefore parse successfully,
 but `CpFlags::populate` queries only the five IDs above — no cp module
 reads them at 1.0.
 
-Note on overwrite: `doc/cp.pdxdoc` §9 describes refusing an existing
-destination unless `--over-existing` is present. The current body does
-not implement that gate — `copy_bytes_only` opens the destination with
-`O_WRONLY | O_CREAT` (`0x41`) on every invocation.
+Note on overwrite: cp does not refuse an existing destination (with or
+without `--over-existing`) — it always overwrites, matching POSIX cp's
+default. `copy_bytes_only` opens the destination with `O_WRONLY |
+O_CREAT | O_TRUNC` (`0xC1`, previously `0x41` with no `O_TRUNC` — a
+short source over a longer existing destination used to leave the old
+file's stale tail bytes in place). The kernel side
+(`src/kernel/core/fs/vfs_open.pdx`) still marks `O_TRUNC` "deferred to
+R16.M2" and does not act on the bit yet, so truncation is not
+observable at runtime today — this is a correct, forward-compatible
+cp-side fix, not a claim that overwrite is currently byte-correct.
 
 ## Semantic pipe output
 
@@ -141,10 +176,13 @@ Defined as `Dispatch::EXIT_*` in `src/dispatch.pdx`.
 | 1 | `EXIT_OP_FAIL` | Operation failed: open-src, open-dst, read, write, short write, `mkdir`/`opendir`/`readdir` under `-r`, TXN begin failure, TXN commit failure. | Yes. |
 | 2 | `EXIT_USAGE` | argv parse error (from `cp_main`) or `pos_count != 2` (from `dispatch_copy`). | Yes. |
 | 3 | `EXIT_NOT_YET_IMPL` | Reserved: "vocabulary recognised, body not wired". | No — no 1.0 code path returns it. |
-| 4 | `EXIT_CAP_DENIED` | Reserved: cap denied / elevate refused. | No — an elevate refusal currently falls through to the ordinary open-fail path and exits 1. |
+| 4 | `EXIT_CAP_DENIED` | Cap denied — the elevate broker refused (or is unreachable) on the destination-parent retry. | Yes — `copy_open_dst_cap_denied` prints `cp: elevate refused (dst-parent out of scope)` and returns 4. Since libpdx-elevate.M1 has no broker daemon running, every elevate attempt is refused today, so any dst-open failure that reaches the elevate retry currently ends in exit 4 rather than exit 1. |
 
 Codes 3 and 4 are kept distinct so a script can tell "not implemented"
-and "missing capability" apart from a generic operation failure.
+and "missing capability" apart from a generic operation failure. Exit
+1 also now covers two new pre-TXN safety gates: `src == dst` (or dst
+nested under src) and the recursive walk's pending-directory worklist
+filling up (bounded at 128 simultaneously-pending subdirectories).
 
 ## Capabilities
 
@@ -254,7 +292,7 @@ state, all `u64` unless noted:
 | `undo_stat_buf` | `[u8; 144]` | Statbuf destination for `pdxfs_stat` |
 | `undo_gate_calls` | `u64` | Total gate invocations (one per destination file) |
 | `undo_gate_noflag` | `u64` | Skipped: `--over-existing` absent |
-| `undo_gate_noexist` | `u64` | Skipped: `pdxfs_stat` reported the destination absent |
+| `undo_gate_noexist` | `u64` | Skipped: `pdxfs_stat` reported the destination absent (real syscall as of cp.ENH-001; previously an M2 stub that always reported absent) |
 | `undo_records_wrote` | `u64` | Journal writes attempted |
 
 ## See also

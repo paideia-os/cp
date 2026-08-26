@@ -55,19 +55,18 @@ requires:
   # (R42 substrate, landed alongside KIND_PDXFS_FILE at commit 411ad0e).
   - KIND_PDXFS_TXN (invoke)
 
-# --- placeholder: elevate-broker binding -------------------------------
-# Reserved for the M3-003 wire-up. Uncomment when libpdx-elevate.M3 is
-# in-tree and the paideia-os elevate broker (R48.M7 at
-# src/kernel/core/ipc/elevate_broker.pdx) is running. In M1 the cross-
-# subtree path refuses at the dispatch layer with a clear diagnostic
-# rather than opening a broker hop the substrate does not yet expose.
-#
-#   - KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
-#
-# The M3 addition changes only this file; every other cp code path
-# keeps its M1 shape (the elevate request lives inside the cross-
-# subtree branch in dispatch.pdx which today prints the "not-yet-
-# implemented" line).
+# --- elevate-broker binding (cp.ENH-011) --------------------------------
+# M3-003 landed src/elevate.pdx (CpElevate::cp_elevate_try_dst_parent),
+# manifest.pdxproj carries libpdx-elevate @ ^0.1 as a hard dep, and
+# copy.pdx calls cp_elevate_try_dst_parent on every destination-open
+# failure — i.e. cp attempts the broker hop on EVERY invocation, not
+# only a hypothetical future cross-subtree path. The M1-era comment
+# that used to live here ("the cross-subtree path refuses at the
+# dispatch layer") stopped being true at M3-003 and this decl was never
+# updated to match, so cp's declared cap set did not cover a hop it
+# actually attempts. Uncommented now that libpdx-cap's OK|MISSING|EXTRA
+# manifest compare would otherwise reject every cp exec.
+- KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
 
 # Declared output schemas — the semantic-pipe schema records this tool
 # emits on its stdout. M1 emits none (single-file copy is silent on

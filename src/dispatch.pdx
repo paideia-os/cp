@@ -79,18 +79,24 @@ module Dispatch = structure {
     "cp: usage error (expected exactly two positional arguments)\n"
   pub let USAGE_MSG_LEN : u64 = 60
 
-  // Retained from M1 for symmetry / diagnostic testability; unreachable
-  // on the M2 happy-flow path. Kept because a future gating change
-  // (e.g. --no-recurse suppress) may re-enter this arm.
-  pub let RECURSIVE_NOT_YET_MSG : [u8; 64] =
-    "cp: recursive copy (-r) not yet implemented at M1 (lands at M2)\n"
-  pub let RECURSIVE_NOT_YET_MSG_LEN : u64 = 64
+  // cp.ENH-008: emitted when dispatch_paths_conflict refuses the
+  // invocation (src == dst, or dst nested under src).
+  pub let SAME_PATH_MSG : [u8; 50] =
+    "cp: source and destination refer to the same path\n"
+  pub let SAME_PATH_MSG_LEN : u64 = 50
 
-  // M1-era stub message. Kept for grep-ability across the M1→M2
-  // transition; no M2 code path emits it.
-  pub let COPY_STUB_MSG : [u8; 58] =
-    "cp: copy body not implemented at M1-002 (lands at M1-003)\n"
-  pub let COPY_STUB_MSG_LEN : u64 = 58
+  // cp.ENH-006: emitted (then exit 0) when --dry-run short-circuits
+  // dispatch before any TXN/copy/walk call.
+  pub let DRY_RUN_MSG : [u8; 29] =
+    "cp: dry run: no changes made\n"
+  pub let DRY_RUN_MSG_LEN : u64 = 29
+
+  // cp.ENH-014: RECURSIVE_NOT_YET_MSG (M1's "-r not yet implemented"
+  // message — dead since -r really works as of cp.ENH-003, not just
+  // since M2) and COPY_STUB_MSG (M1-002 stub message, dead since
+  // M1-003) were removed here. Neither had any emitter left in the
+  // tree; dead .rodata with no reader is exactly what this cleanup
+  // issue named.
 
   // -- TXN failure diagnostics (M2-004) ---------------------------------
   //
@@ -139,6 +145,94 @@ module Dispatch = structure {
         xor rax, rax;
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dispatch_paths_conflict(src_ptr, dst_ptr) -> rc
+  //
+  // Signature: dispatch_paths_conflict : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): src_ptr — VA of a NUL-terminated source path
+  // RSI (input): dst_ptr — VA of a NUL-terminated destination path
+  // RAX (output): 0 (no conflict) or 1 (conflict — caller must refuse)
+  //
+  // cp.ENH-008. Two literal-string checks (no path canonicalization —
+  // cp does not canonicalize paths anywhere else either, so this is
+  // consistent with the rest of the tool, not a new limitation):
+  //   1. src_ptr and dst_ptr are byte-for-byte identical (`cp a a`).
+  //   2. dst_ptr begins with src_ptr's full text followed by '/'
+  //      (dst is nested under src, e.g. `cp -r a a/sub` — without this
+  //      gate the recursive walk landed by cp.ENH-003 would try to
+  //      copy the destination tree into itself as it grows).
+  // Both scans are capped at 255 bytes, matching PATH_MAX=256 used
+  // throughout the walk/pdxfs modules; a false negative on a path
+  // longer than that is an accepted, pre-existing system-wide limit,
+  // not new here.
+  //
+  // Leaf; uses rax/rcx/rdx/r8 as scratch (all caller-save). No
+  // callee-save touched, no push/pop needed.
+  // ============================================================================
+  pub let dispatch_paths_conflict : (u64, u64) -> u64 !{mem} @{} =
+    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp.ENH-008 Dispatch::dispatch_paths_conflict. Phase 1 (dpc_eq_*): byte-by-byte compare of src_ptr (rdi) and dst_ptr (rsi) via mov_b [reg+reg*1] scaled indexing (proven at path.pdx/readdir.pdx/svc_broker.pdx), capped at 255 bytes; a mismatch bails to Phase 2, and simultaneous NUL bytes at the same index means the two strings are identical -> conflict. Phase 2 (dpc_srclen_* / dpc_prefix_*): computes strlen(src_ptr) capped at 255 (dpc_srclen_top, same xor-then-mov_b idiom as src/user/mkdir.pdx's mkdir_strlen_loop), then compares dst_ptr[0..srclen) to src_ptr[0..srclen) byte-by-byte; if every byte matches AND dst_ptr[srclen] == '/' (0x2F), dst is nested directly under src -> conflict. Any mismatch in either phase falls through to dpc_no_conflict (rax=0). Leaf; rax/rcx/rdx/r8 scratch (all caller-save), no callee-save touched, no push/pop needed. No `add reg,[mem]`. No test mnemonic.",
+      block: {
+        // ---- Phase 1: exact-match check --------------------------------------
+        xor rcx, rcx;
+      dpc_eq_top:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rcx*1];
+        cmp rax, rdx;
+        jne dpc_eq_done;
+        cmp rax, 0;
+        je dpc_conflict;                       // both NUL here -> identical
+        add rcx, 1;
+        cmp rcx, 255;
+        jae dpc_eq_done;
+        jmp dpc_eq_top;
+      dpc_eq_done:
+
+        // ---- Phase 2: is dst nested directly under src? ----------------------
+        xor rcx, rcx;
+      dpc_srclen_top:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        cmp rax, 0;
+        je dpc_srclen_done;
+        add rcx, 1;
+        cmp rcx, 255;
+        jae dpc_srclen_done;
+        jmp dpc_srclen_top;
+      dpc_srclen_done:
+        // rcx = strlen(src_ptr), capped at 255.
+
+        xor r8, r8;
+      dpc_prefix_top:
+        cmp r8, rcx;
+        jae dpc_prefix_matched;
+        xor rax, rax;
+        mov_b rax, [rdi + r8*1];
+        xor rdx, rdx;
+        mov_b rdx, [rsi + r8*1];
+        cmp rax, rdx;
+        jne dpc_no_conflict;
+        add r8, 1;
+        jmp dpc_prefix_top;
+      dpc_prefix_matched:
+        xor rax, rax;
+        mov_b rax, [rsi + rcx*1];
+        cmp rax, 47;                           // '/'
+        jne dpc_no_conflict;
+
+      dpc_conflict:
+        mov rax, 1;
+        ret;
+
+      dpc_no_conflict:
+        xor rax, rax;
         ret
       }
     }
@@ -207,6 +301,37 @@ module Dispatch = structure {
         mov rax, [r11];
         cmp rax, 2;
         jne dispatch_usage_error;
+
+        // ---- Step 2b (cp.ENH-008): refuse src==dst / dst-under-src --------
+        // Neither check existed at v1.0.0: `cp a a` opened the same
+        // vnode read-only and write-only-with-create and entered the
+        // copy loop with two independent file offsets on one inode
+        // (no diagnostic, no refusal); `cp -r a a/sub` would recurse
+        // without bound once the walk body did real work (cp.ENH-003).
+        // dispatch_paths_conflict is a pre-TXN gate (like the pos_count
+        // check above) so a conflicting invocation never opens a TXN,
+        // never mkdirs/opens anything, and exits before any byte moves.
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
+        mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
+        call dispatch_paths_conflict;
+        cmp rax, 0;
+        jne dispatch_same_path_error;
+
+        // ---- Step 2c (cp.ENH-006): --dry-run short-circuit -----------------
+        // v1.0.0 parsed --dry-run into CpFlags::flag_dry_run_seen and no
+        // code path ever read it back — `cp --dry-run a b` performed a
+        // real, complete copy (doc/enhancement-plan.md §2.3: "the only
+        // unimplemented flag whose failure mode is doing the destructive
+        // thing the user explicitly asked it not to do"). This gate runs
+        // before pdxfs_txn_begin — same pre-TXN placement as the
+        // pos_count and paths_conflict gates above — so a --dry-run
+        // invocation never opens a TXN and never calls copy_bytes_only /
+        // walk_recursive, guaranteeing zero destination writes.
+        lea r11, [rip + flag_dry_run_seen];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne dispatch_dry_run_exit;
 
         // ---- Step 3: open outer TXN ----------------------------------------
         call pdxfs_txn_begin;
@@ -289,6 +414,27 @@ module Dispatch = structure {
         call print_err;
 
         mov rax, 2;                            // EXIT_USAGE
+        jmp dispatch_epilogue;
+
+      dispatch_dry_run_exit:
+        // cp.ENH-006. No TXN was opened and no body was called — this
+        // path is the guarantee, not just the message.
+        lea rdi, [rip + DRY_RUN_MSG];
+        mov rsi, 29;                           // DRY_RUN_MSG_LEN
+        call print_err;
+
+        xor rax, rax;                          // EXIT_OK — a dry run that
+                                                // wrote nothing is success
+        jmp dispatch_epilogue;
+
+      dispatch_same_path_error:
+        // cp.ENH-008. No TXN was opened (this gate runs before Step 3),
+        // so there is nothing to abort — just diagnose and exit.
+        lea rdi, [rip + SAME_PATH_MSG];
+        mov rsi, 50;                           // SAME_PATH_MSG_LEN
+        call print_err;
+
+        mov rax, 1;                            // EXIT_OP_FAIL
         jmp dispatch_epilogue;
 
       dispatch_epilogue:

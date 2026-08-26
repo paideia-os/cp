@@ -124,18 +124,16 @@ module Copy = structure {
     "cp: short write to destination (partial state)\n"
   pub let SHORT_WRITE_MSG_LEN : u64 = 47
 
-  // Retained for source-level continuity across the M1→M2 transition;
-  // the M2-004 dispatch-level TXN wrap means the TXN failure
-  // diagnostics now emit from Dispatch::dispatch_copy (see
-  // dispatch.pdx TXN_BEGIN_FAIL_MSG / TXN_COMMIT_FAIL_MSG). No M2
-  // code path in this module emits either string.
-  pub let TXN_BEGIN_FAIL_MSG : [u8; 29] =
-    "cp: transaction begin failed\n"
-  pub let TXN_BEGIN_FAIL_MSG_LEN : u64 = 29
-
-  pub let TXN_COMMIT_FAIL_MSG : [u8; 30] =
-    "cp: transaction commit failed\n"
-  pub let TXN_COMMIT_FAIL_MSG_LEN : u64 = 30
+  // cp.ENH-014: the M1-era TXN_BEGIN_FAIL_MSG / TXN_COMMIT_FAIL_MSG
+  // pair that used to live here was removed — the M2-004 dispatch-
+  // level TXN wrap moved the diagnostics to Dispatch::dispatch_copy's
+  // own (distinct) constants of the same name, and no code path in
+  // this module ever emitted this copy. Two same-named `pub let`
+  // .rodata constants across Copy and Dispatch was also a latent
+  // duplicate-symbol risk (see the ENH-010 finding on `call reset`'s
+  // bare-label ambiguity, which applies equally to a bare `[rip +
+  // LABEL]` reference); removing the dead one here removes that risk
+  // for this pair without needing to resolve the open question.
 
   // ============================================================================
   // copy_reset()
@@ -259,9 +257,23 @@ module Copy = structure {
         mov rdi, r12;                          // dst_ptr
         call maybe_record_over_existing;
 
-        // ---- Step 3: open destination (O_WRONLY | O_CREAT = 0x41) -----------
+        // ---- Step 3 (cp.ENH-004): open destination (O_WRONLY|O_CREAT|
+        // ---- O_TRUNC = 0xC1) -------------------------------------------------
+        // v1.0.0 opened 0x41 (O_WRONLY|O_CREAT) with no O_TRUNC, so
+        // copying a short source over a longer existing destination
+        // left the old file's stale tail bytes in place — the
+        // destination ended up neither the source nor the original,
+        // silently corrupt, with cp exiting 0. O_TRUNC (0x80,
+        // Pdxfs::O_TRUNC) is now always OR'd in. NOTE: the kernel side
+        // (src/kernel/core/fs/vfs_open.pdx) still marks O_TRUNC
+        // "deferred to R16.M2" and does not act on the bit yet, so
+        // this fix is not yet observable at runtime — it is a
+        // correct, forward-compatible cp-side fix that starts
+        // truncating for real the moment vfs_open honours the bit,
+        // with no further cp-side change required (see cp #20 for the
+        // tracked kernel-side dependency).
         mov rdi, r12;                          // dst_ptr
-        mov rsi, 0x41;                         // O_WRONLY | O_CREAT
+        mov rsi, 0xC1;                         // O_WRONLY | O_CREAT | O_TRUNC
         call pdxfs_open;
         cmp rax, 0;
         jge copy_open_dst_ok;                  // success on first try
@@ -278,11 +290,12 @@ module Copy = structure {
         mov rdi, r12;                          // dst_ptr (informational)
         call cp_elevate_try_dst_parent;
         cmp rax, 0;                            // CP_ELEVATE_OK?
-        jne copy_open_dst_fail;                // refused → normal fail
+        jne copy_open_dst_cap_denied;          // refused → cp.ENH-012 exit 4
 
-        // Elevate approved — retry the open once.
+        // Elevate approved — retry the open once (same flags as the
+        // first attempt, cp.ENH-004: O_TRUNC included).
         mov rdi, r12;                          // dst_ptr
-        mov rsi, 0x41;                         // O_WRONLY | O_CREAT
+        mov rsi, 0xC1;                         // O_WRONLY | O_CREAT | O_TRUNC
         call pdxfs_open;
         cmp rax, 0;
         jl copy_open_dst_fail;                 // still failing → give up
@@ -392,6 +405,24 @@ module Copy = structure {
         mov rsi, 33;                           // OPEN_DST_FAIL_MSG_LEN
         call print_err;
         mov rax, 1;
+        jmp copy_epilogue;
+
+      copy_open_dst_cap_denied:
+        // cp.ENH-012: the elevate broker refused (or is unreachable —
+        // libpdx-elevate.M1 collapses both into CP_ELEVATE_REFUSED, so
+        // cp cannot distinguish them yet). doc/cp.pdxdoc §6 promises
+        // "on refuse, cp exits 4 with a stderr diagnostic naming the
+        // missing cap"; v1.0.0 fell through to copy_open_dst_fail and
+        // exited 1 like any other open failure, making the documented
+        // exit-4 contract fiction. fd_src is open; close it before
+        // returning.
+        mov rdi, r13;
+        call pdxfs_close;
+
+        lea rdi, [rip + ELEVATE_REFUSED_MSG];
+        mov rsi, 46;                           // ELEVATE_REFUSED_MSG_LEN
+        call print_err;
+        mov rax, 4;                            // EXIT_CAP_DENIED
         jmp copy_epilogue;
 
       copy_read_fail:

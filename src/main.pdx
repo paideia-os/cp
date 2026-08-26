@@ -135,6 +135,21 @@ module Main = structure {
         call cp_audit_reset;
         call cp_elevate_reset;
 
+        // Step 2b (cp.ENH-014): reset every remaining module's counter
+        // .bss so cp_main's startup baseline is uniform across every
+        // module, not just the M3 trio above. copy_reset/walk_reset are
+        // already self-invoked at the top of copy_bytes_only/
+        // walk_recursive (harmless double-reset here); undo_reset and
+        // signed_inode_reset previously had NO caller anywhere in the
+        // tree — benign under one-process-one-copy (load-zeroed .bss),
+        // but exactly the gap a future multi-copy-per-process shape
+        // would silently rely on. All four are leaves; ordering vs
+        // parse is irrelevant, same as the M3 trio.
+        call copy_reset;
+        call walk_reset;
+        call undo_reset;
+        call signed_inode_reset;
+
         // Step 3: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
         mov rsi, r12;
