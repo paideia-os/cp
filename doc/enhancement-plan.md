@@ -301,22 +301,24 @@ Filed into milestone **Enhancement v1.1 — cp**. Ordering is dependency-
 first: the substrate flip (ENH-001) unblocks the two features that are
 currently silent no-ops.
 
-| # | Title | Effort | Deps |
-|---|---|---|---|
-| ENH-001 | Flip pdxfs stat/getdents/mkdir stubs to real syscalls 77/78/79 | M | none |
-| ENH-002 | `cp -r` fails loud instead of exiting 0 having copied nothing | XS | none |
-| ENH-003 | Land the recursive per-entry walk body | L | 001, 002 |
-| ENH-004 | Destination open lacks O_TRUNC — overwrite leaves stale tail bytes | S | none |
-| ENH-005 | `cp <src> <bare-name>` fails: O_CREAT refuses slash-less paths | S | none |
-| ENH-006 | `--dry-run` is parsed and ignored — performs a real copy | S | none |
-| ENH-007 | TXN begin/commit/abort are no-ops while docs assert atomicity | M | none |
-| ENH-008 | Refuse `cp a a` and dst-under-src | S | none |
-| ENH-009 | manifest entry symbol `CpMain::cp_main` no longer exists | XS | none |
-| ENH-010 | `call reset` binds one symbol for two libpdx-argv functions | XS | none |
-| ENH-011 | `caps.decl` omits KIND_ELEVATE_CHANNEL though elevate.pdx calls it | XS | none |
-| ENH-012 | Elevate refusal exits 1; exit 3/4 contract is fiction | S | 011 |
-| ENH-013 | `doc/cp.pdxdoc` aspirational-cruft sweep (nine mismatches) | S | 004, 006, 007, 012 |
-| ENH-014 | Dead code + uncalled resets sweep | XS | none |
+| # | GH | Title | Effort | Deps |
+|---|---|---|---|---|
+| ENH-001 | #17 | Flip pdxfs stat/getdents/mkdir stubs to real syscalls 77/78/79 | M | none |
+| ENH-002 | #18 | `cp -r` fails loud instead of exiting 0 having copied nothing | XS | none |
+| ENH-003 | #19 | Land the recursive per-entry walk body | L | #17, #18 |
+| ENH-004 | #20 | Destination open lacks O_TRUNC — overwrite leaves stale tail bytes | S | none |
+| ENH-005 | #21 | `cp <src> <bare-name>` fails: O_CREAT refuses slash-less paths | S | none |
+| ENH-006 | #22 | `--dry-run` is parsed and ignored — performs a real copy | S | none |
+| ENH-007 | #23 | TXN begin/commit/abort are no-ops while docs assert atomicity | M | none |
+| ENH-008 | #24 | Refuse `cp a a` and dst-under-src | S | none |
+| ENH-009 | #25 | manifest entry symbol `CpMain::cp_main` no longer exists | XS | none |
+| ENH-010 | #26 | `call reset` binds one symbol for two libpdx-argv functions | XS | none |
+| ENH-011 | #27 | `caps.decl` omits KIND_ELEVATE_CHANNEL though elevate.pdx calls it | XS | none |
+| ENH-012 | #28 | Elevate refusal exits 1; exit 3/4 contract is fiction | S | #27 |
+| ENH-013 | #29 | `doc/cp.pdxdoc` aspirational-cruft sweep (nine mismatches) | S | #20, #22, #23, #28 |
+| ENH-014 | #30 | Dead code + uncalled resets sweep | XS | #18 |
+
+Milestone: **Enhancement v1.1 — cp** (milestone 6).
 
 ### Monorepo companions (flagged, not filed here)
 
