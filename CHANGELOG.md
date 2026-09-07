@@ -7,6 +7,92 @@ and every issue it lands, so the release-tag ↔ code-tree ↔ issue-
 graph triangulation the signing pipeline uses at `paideia-as
 release --sign` time is reproducible from this file alone.
 
+## 1.1.0-A — 2026-09-07
+
+**Real body extraction.** Retires the M1-001 STUB shape shipped by
+v1.0 (the KIND_PDXFS_TXN begin/commit/abort trio, libpdx-audit +
+libpdx-elevate + libpdx-semantic-pipe wire-ins, the recursive
+walker, --over-existing undo journalling, and the cap-tail signed-
+inode preservation — every one of them a shape-in-place stub
+against a substrate that has not landed). What ships in v1.1-A is
+a five-syscall real body: sys_open, sys_read, sys_write, sys_close,
+sys_stat.
+
+### Added
+
+- `src/copy.pdx` — v1.1-A `copy_bytes_only(src_ptr, dst_ptr)` body:
+  1. sys_stat(DST) — if DST resolves to a directory (POSIX mode with
+     S_IFDIR bits), construct effective DST = DST + "/" + basename(SRC)
+     into `copy_dst_path` (.bss, 512 bytes).
+  2. sys_stat(SRC) — extract POSIX mode word (u32 @ statbuf+24);
+     fall back to 0644 when the backend fills mode=0 (tmpfs today).
+  3. sys_open(SRC, O_RDONLY, 0).
+  4. sys_open(effective_DST, O_WRONLY|O_CREAT|O_TRUNC=0xC1, src_mode).
+  5. Read/write loop over the 4 KiB `copy_buf` .bss scratch until EOF.
+  6. sys_close(dst); sys_close(src).
+  7. Return 0 on success or the raw negative-errno u64 from the
+     failing syscall on any failure.
+- `src/copy.pdx::copy_join_dir_basename` — leaf helper that builds
+  the effective DST path when DST resolves to a directory. Caps the
+  combined length at 511 bytes (+ NUL) to fit the 512-byte .bss slot.
+- `src/pdxfs.pdx::pdxfs_open` widens to arity 3 — `(path, flags, mode)`
+  — so the caller preserves the source's POSIX mode word when
+  creating the destination. v1.0 hard-wired mode=0.
+
+### Removed
+
+- `src/audit.pdx` — libpdx-audit begin/commit wrap.
+- `src/elevate.pdx` — libpdx-elevate cross-subtree retry.
+- `src/undo.pdx` — --over-existing undo record path.
+- `src/pipe.pdx` — CopyProgressRecord schema bind + emit.
+- `src/signed_inode.pdx` — cap-tail preservation.
+- `src/walk.pdx` — -r recursive walker.
+- `src/flags.pdx` — cp-owned flag registration (no cp-owned flags
+  at v1.1-A; libpdx-argv's StdVocab still parses --help / --version /
+  --verbose / --dry-run so the recognisers do not error, but no arm
+  consumes them).
+- `src/pdxfs.pdx::pdxfs_txn_begin` / `pdxfs_txn_commit` /
+  `pdxfs_txn_abort` — KIND_PDXFS_TXN stubs (returned 0).
+- `src/pdxfs.pdx::pdxfs_readdir` / `pdxfs_mkdir` — walker-only
+  entry points (no walker in v1.1-A).
+- Manifest deps: libpdx-semantic-pipe, libpdx-audit, libpdx-elevate.
+- Caps decl entries: KIND_IPC_ENDPOINT, KIND_PDXFS_TXN,
+  KIND_ELEVATE_CHANNEL.
+
+### Changed
+
+- `src/dispatch.pdx::dispatch_copy` collapses from the v1.0
+  audit-wrap + TXN-wrap + flags-populate + dry-run + paths-conflict +
+  recursive-route shell to a two-step body: pos_count==2 gate then
+  `copy_bytes_only` call. Return propagates copy body's rax verbatim.
+- `src/main.pdx::cp_main` drops the seven counter-resets
+  (cp_pipe_reset / cp_audit_reset / cp_elevate_reset / copy_reset /
+  walk_reset / undo_reset / signed_inode_reset), the
+  `register_cp_flags` call, and the `cp_pipe_bind_stdout` call. The
+  argv-parse pipeline (FlagSpec::reset -> StdVocab::register_all ->
+  ParsedArgs::reset -> Parser::parse_argv) plus `dispatch_copy` is
+  the whole body.
+- Exit codes: 0 on success, 2 on usage / parse error, or the raw
+  negative-errno u64 from the failing syscall on copy failure. v1.0's
+  EXIT_OP_FAIL (1), EXIT_NOT_YET_IMPL (3), EXIT_CAP_DENIED (4) all
+  retire with the M1-001 STUB shape.
+
+### Deferred to v1.2
+
+- `-p` (preserve permissions beyond the source mode word — atime,
+  mtime, uid, gid) once `sys_utimes` and `sys_chown` land.
+- `-r` (recursive walk) once `sys_getdents` sits on a real,
+  non-terminator-stub backend contract.
+- `-i` (interactive overwrite) is out of scope for a non-interactive
+  R50 tool.
+
+### Notes
+
+- paideia-as v0.36+ is the toolchain floor (`mov_b` + `mov_d`
+  narrow-load mnemonics + `@align` attribute on `.bss` slots).
+- No GitHub Actions per `feedback_paideia_os_no_cicd`. Verification
+  is local via `bash tools/build.sh` + `bash tools/run-qemu.sh`.
+
 ## 1.0.0 — 2026-08-22
 
 **Milestone close.** M5 — 1.0 signed release. Dual-signed

@@ -1,25 +1,26 @@
-# cp — paideia-as build manifest
+# cp -- paideia-as build manifest
 #
-# Wave: R50  Milestone: M5 (1.0 signed release — dual-signed
-#                            manifest.pdxsig, CHANGELOG-1.0 entry,
-#                            doc/cp.pdxdoc for `doc cp`, and mirror-push
-#                            manifest at .plans/pkgs-mirror-push.md.
-#                            Version bumped 0.4.0-m4 → 1.0.0.)
-# Doc:   design/tooling/r49-r50-plan.md §5.6 + §9.3 in the paideia-os repo.
+# Wave: R50  Milestone: v1.1-A (real body extraction)
 #
-# Consumed by `paideia-as build`. Each line is a directive; blank lines
-# and lines starting with `#` are ignored. The M1 format is deliberately
-# minimal — one target, one entry point, a source list, a dep list, and
-# the caps-manifest that ships in the packaged binary. paideia-as v0.33+
-# is the required toolchain floor (mov_b narrow-load mnemonic + @align
-# attribute on .bss slots per the #1248 mitigation).
+# v1.1-A retires the M1-001 STUB shape shipped by cp v1.0 -- the
+# KIND_PDXFS_TXN begin/commit/abort trio, the libpdx-audit + libpdx-
+# elevate + libpdx-semantic-pipe wire-ins, the recursive walker, the
+# --over-existing undo record path, and the cap-tail signed-inode
+# preservation -- all of which were shape-in-place stubs against
+# not-yet-landed substrates. What ships in v1.1-A is a five-syscall
+# real body: sys_open + sys_read + sys_write + sys_close + sys_stat.
+#
+# Consumed by `paideia-as build`. Each line is a directive; blank
+# lines and lines starting with `#` are ignored. paideia-as v0.36+
+# is the required toolchain floor (mov_b + mov_d narrow-load
+# mnemonics + @align attribute on .bss slots).
 #
 # The build produces one output file at build-out/cp (the elaborated
-# .pdx → ELF-like Paideia binary) plus a caps-manifest copy at
-# build-out/cp.caps for the InitCap sidecar packaging step at M5.
+# .pdx -> ELF-like Paideia binary) plus a caps-manifest copy at
+# build-out/cp.caps for the InitCap sidecar packaging step.
 
 name        = cp
-version     = 1.0.0
+version     = 1.1.0-A
 kind        = tool
 entry       = Main::cp_main
 output      = build-out/cp
@@ -30,56 +31,37 @@ doc_file    = doc/cp.pdxdoc
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
 #
-# Grouped by the milestone-issue that adds each file:
-#   M1-002 lands: print, dispatch, main (argv surface + flag gate).
-#   M1-003 lands: pdxfs, copy (first-runnable single-file copy).
-#   M2-001 lands: flags, walk (typed-flag registration + recursive walk).
-#   M2-002 lands: signed_inode (cap-tail preservation stub).
-#   M2-005 lands: undo (--over-existing PdxFS v1 undo record stub).
-#   M3-001 lands: pipe   (CopyProgressRecord[] schema bind + emit).
-#   M3-002 lands: audit  (CopyRecord via libpdx-audit begin/commit wrap).
-#   M3-003 lands: elevate (libpdx-elevate retry on cross-subtree dst-parent).
+# v1.1-A source count: 5 (down from v1.0's 12). Retired modules:
+#   flags.pdx        -- no cp-owned flags at v1.1-A
+#   walk.pdx         -- no -r flag
+#   signed_inode.pdx -- cap-tail preservation stub
+#   undo.pdx         -- --over-existing undo record stub
+#   pipe.pdx         -- CopyProgressRecord schema bind + emit
+#   audit.pdx        -- libpdx-audit begin/commit wrap
+#   elevate.pdx      -- libpdx-elevate cross-subtree retry
 sources:
-  - src/print.pdx                 # M1-002 sys_write(fd=1/2) helper
-  - src/pdxfs.pdx                 # M1-003 + M2 open/read/write/close/txn/readdir/mkdir/stat
-  - src/copy.pdx                  # M1-003 + M2 + M3 single-file copy body (bytes-only extract)
-  - src/dispatch.pdx              # M1-002 + M2 + M3 flag gate + audit wrap + typed flags + recursive route
-  - src/main.pdx                  # M1-002 + M2 + M3 cp_main(argc, argv) entry point
-  - src/flags.pdx                 # M2-001 CpFlags: typed-flag registration + mirror
-  - src/walk.pdx                  # M2-001 Walk: recursive -r directory walk
-  - src/signed_inode.pdx          # M2-002 SignedInode: cap-tail preservation stub
-  - src/undo.pdx                  # M2-005 Undo: --over-existing PdxFS v1 undo record stub
-  - src/pipe.pdx                  # M3-001 CpPipe: CopyProgressRecord@0.1 schema bind + per-file emit
-  - src/audit.pdx                 # M3-002 CpAudit: CopyRecord begin/commit wrap around dispatch
-  - src/elevate.pdx               # M3-003 CpElevate: libpdx-elevate retry on dst-parent open fail
+  - src/print.pdx      # sys_write(fd=1/2) helper
+  - src/pdxfs.pdx      # sys_open/read/write/close/stat trampolines
+  - src/copy.pdx       # real-body single-file copy (stat + open + loop + close)
+  - src/dispatch.pdx   # pos_count validate + route to copy body
+  - src/main.pdx       # cp_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------
-# M3 pulls libpdx-argv, libpdx-semantic-pipe, libpdx-audit, libpdx-
-# elevate. libpdx-cap remains M2-substrate-only today (signed-inode
-# helpers land in libpdx-cap.M3 — cp's signed_inode module is a
-# shape-in-place stub until then).
+# v1.1-A collapses the v1.0 dep list from four libraries to one:
 #
-#   libpdx-argv           → StdVocab + FlagSpec + Parser + ParsedArgs
-#   libpdx-semantic-pipe  → Binding::libpdx_semantic_pipe_bind + Send::send_record
-#                            for CopyProgressRecord@0.1 (M3-001).
-#   libpdx-audit          → AuditClient::audit_begin + audit_commit
-#                            for CopyRecord (M3-002).
-#   libpdx-elevate        → ElevateClient::elevate_client_request
-#                            for the cross-subtree dst-parent retry (M3-003).
+#   libpdx-argv           -- StdVocab + FlagSpec + Parser + ParsedArgs.
+#
+# Retired: libpdx-semantic-pipe (CopyProgressRecord bind + emit),
+#          libpdx-audit (CopyRecord begin/commit wrap),
+#          libpdx-elevate (cross-subtree dst-parent retry).
 deps:
   - libpdx-argv @ ^0.2
-  - libpdx-semantic-pipe @ ^0.2
-  - libpdx-audit @ ^0.2
-  - libpdx-elevate @ ^0.1
 
 # --- Paideia-as compliance flags ---------------------------------------
-# These mirror the invariants every R49/R50 tool observes and every M1
-# file in this repo is written against. Documented here so a build under
-# a non-conforming paideia-as revision refuses fast.
 compliance:
   - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
   - no-test-mnemonic              # zero-check via cmp reg, 0
-  - cmp-imm32-only                # cmp reg, imm ≤ 0x7FFFFFFF; else stage via r11
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
   - r11-scratch                   # r11 is not preserved across calls
   - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call

@@ -1,12 +1,36 @@
 # cp — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M5 (1.0 signed release) — complete
-**Version:** 1.0.0 (release-tag pending signing pipeline —
-`manifest.pdxsig` author + paideia_root fields are `<pending-*>`
-placeholders until paideia-as v0.33-crypto exposes `ml_dsa_65_sign`)
+**Current milestone:** v1.1-A (real body extraction) — code landed
+**Version:** 1.1.0-A (2026-09-07)
 
-## Milestone map
+## v1.1-A overview
+
+Retires the M1-001 STUB shape shipped by v1.0 — every stubbed hook
+against a not-yet-landed substrate (KIND_PDXFS_TXN begin/commit/abort,
+libpdx-audit + libpdx-elevate + libpdx-semantic-pipe wire-ins, the
+recursive walker, --over-existing undo, signed-inode cap-tail
+preservation). What ships in v1.1-A is a five-syscall real body:
+`sys_open`, `sys_read`, `sys_write`, `sys_close`, `sys_stat`.
+
+Source count: 5 files (down from 12).
+
+- `src/main.pdx`     — argv parse + dispatch call.
+- `src/dispatch.pdx` — pos_count == 2 gate + copy_bytes_only call.
+- `src/copy.pdx`     — sys_stat(DST → basename join) → sys_stat(SRC →
+                        mode) → sys_open × 2 → read/write loop → close × 2.
+- `src/pdxfs.pdx`    — five real trampolines (open widened to arity 3
+                        to preserve the src mode on destination create).
+- `src/print.pdx`    — sys_write(fd=1|2) helper for diagnostics.
+
+Deferred to v1.2 (real body prerequisites): `-p` (perm preserve beyond
+mode word), `-r` (recursive walk on a real getdents backend). Out of
+scope: `-i` (interactive).
+
+## Historical milestone map (v1.0)
+
+*Retained for release-tag ↔ code-tree traceability. Every M2/M3 stub
+listed below is retired at v1.1-A.*
 
 - **M1 — design + skeleton (complete).** Scaffold (caps.decl +
   build manifest — issue #1), argv surface with `[-r|-v|--dry-run|

@@ -1,41 +1,37 @@
-# cp — caps.decl
+# cp -- caps.decl
 #
 # Wave: R50
-# Doc:  design/tooling/r49-r50-plan.md §5.6 in the paideia-os repo.
+# Milestone: v1.1-A (real body extraction)
 #
-# cp copies a source file to a destination. Its M1 milestone (design +
-# skeleton + argv + first-runnable single-file `cp a b`) declares the
-# BASELINE cap set every invocation receives from the loader's InitCap
-# sidecar (paideia-os src/kernel/core/loader/init_caps.pdx, R20b.M4).
+# cp copies a source file to a destination via five kernel syscalls:
+# sys_open, sys_read, sys_write, sys_close, sys_stat. Its v1.1-A
+# caps.decl declares the MINIMUM cap set every invocation receives
+# from the loader's InitCap sidecar.
 #
-# The M1 baseline is the minimum for a single-file copy: identity root
-# for audit, read authority on the source, write authority on the
-# destination-parent subtree, a filesystem transaction cap so the copy
-# is atomic (partial write rolls back at the TXN boundary), and the
-# IPC pipe substrate for the schema records M3 will emit.
+# v1.1-A retires the v1.0 M1-001 STUB cap surface:
 #
-# Cross-subtree elevate (KIND_ELEVATE_CHANNEL) is NOT ambient — M3-003
-# adds a per-op elevate request when the destination-parent path
-# exceeds the invoker's scope. M1 refuses cross-subtree copies with a
-# diagnostic on stderr; the invoker sees a clear message rather than a
-# silent cap-narrow.
+#   KIND_IPC_ENDPOINT (invoke)              -- pipe substrate; retired
+#                                              with libpdx-semantic-pipe.
+#   KIND_PDXFS_TXN (invoke)                 -- retired with the outer
+#                                              txn wrap.
+#   KIND_ELEVATE_CHANNEL (invoke,           -- retired with the cross-
+#     svc.elevate-broker)                      subtree elevate retry.
+#
+# Every one of those was a shape-in-place hook against a substrate
+# that has not landed. v1.1-A declares only what the real body
+# actually uses.
 #
 # Format: `requires:` lists cap-kind names + narrowed rights + optional
-# scope. The M1 caps-decl reader (shared with every R49/R50 tool at
-# libpdx-cap.M2) resolves each name to its KIND_* ordinal at exec time,
-# matches the loader-seeded cap set against this list, and fails-fast
-# with CAP_MANIFEST_MISSING / CAP_MANIFEST_EXTRA if the two do not agree.
+# scope. The caps-decl reader resolves each name to its KIND_* ordinal
+# at exec time, matches the loader-seeded cap set against this list,
+# and fails-fast with CAP_MANIFEST_MISSING / CAP_MANIFEST_EXTRA if the
+# two do not agree.
 requires:
-  # Identity root. The copy asserts destination-user-write authority via
-  # a cap-tail check before it opens the destination file (D3 audit-
-  # first, upgraded from the R48.M1 KIND_USER = 0x190 substrate at
-  # src/kernel/core/cap/kind_user.pdx).
+  # Identity root. KIND_USER = 0x190 (R48.M1 substrate at
+  # src/kernel/core/cap/kind_user.pdx). Present so the invoker
+  # identity is available for future audit journal correlation once
+  # libpdx-audit re-lands cleanly.
   - KIND_USER (self)
-
-  # Baseline pipe substrate (R20b, base kind 5). M3 wires libpdx-
-  # semantic-pipe on top to emit CopyProgressRecord[]; stdin/stdout/
-  # stderr endpoints are seeded by shell at exec via InitCap.
-  - KIND_IPC_ENDPOINT (invoke)
 
   # Read authority on the source subtree. Narrowed to READ (no write).
   # The actual source path is a per-invocation argument; the loader
@@ -49,27 +45,9 @@ requires:
   # parent path prefix at exec so cp cannot write outside the argument.
   - KIND_PDXFS_FILE (write, <dst-parent>)
 
-  # Filesystem transaction cap. Opened once per `cp` invocation so a
-  # per-file failure rolls back every already-written byte. Prevents
-  # partial-copy states from becoming visible. KIND_PDXFS_TXN = 0x196
-  # (R42 substrate, landed alongside KIND_PDXFS_FILE at commit 411ad0e).
-  - KIND_PDXFS_TXN (invoke)
-
-# --- elevate-broker binding (cp.ENH-011) --------------------------------
-# M3-003 landed src/elevate.pdx (CpElevate::cp_elevate_try_dst_parent),
-# manifest.pdxproj carries libpdx-elevate @ ^0.1 as a hard dep, and
-# copy.pdx calls cp_elevate_try_dst_parent on every destination-open
-# failure — i.e. cp attempts the broker hop on EVERY invocation, not
-# only a hypothetical future cross-subtree path. The M1-era comment
-# that used to live here ("the cross-subtree path refuses at the
-# dispatch layer") stopped being true at M3-003 and this decl was never
-# updated to match, so cp's declared cap set did not cover a hop it
-# actually attempts. Uncommented now that libpdx-cap's OK|MISSING|EXTRA
-# manifest compare would otherwise reject every cp exec.
-- KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)   # 0x191 R48.M7
-
-# Declared output schemas — the semantic-pipe schema records this tool
-# emits on its stdout. M1 emits none (single-file copy is silent on
-# success, prints on stderr on error). M3 introduces CopyProgressRecord[]
-# via libpdx-semantic-pipe.
+# Declared output schemas -- the semantic-pipe schema records this tool
+# emits on its stdout. v1.1-A emits none (single-file copy is silent on
+# success, prints on stderr on error). A future milestone re-introduces
+# CopyProgressRecord[] via libpdx-semantic-pipe once the substrate is
+# stable enough to justify carrying the dep.
 declares_output_schemas: (none)

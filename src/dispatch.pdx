@@ -1,132 +1,76 @@
-// src/dispatch.pdx — cp.M1-002 (bodies) + cp.M1-003 (happy-arm wire)
-//                    + cp.M2-001 (typed flags + recursive route)
-//                    + cp.M2-004 (single-TXN hoist across whole invocation)
-//                    + cp.M3-002 (audit begin/commit wrap around dispatch)
-// Dispatch module: flag gate + positional-count validate + route +
-// outer KIND_PDXFS_TXN wrap.
+// src/dispatch.pdx -- cp v1.1-A (real-body dispatch)
+// Dispatch module: positional-count validate + route to copy body.
 //
-// Scope
-// -----
-// The M2 argv surface accepts four cp-specific flags (`-r`, `-v`,
-// `--dry-run`, `--over-existing`) and two required positionals (src,
-// dst). This module populates CpFlags::* mirror slots from libpdx-argv's
-// typed-flag storage (populated by Parser::parse_argv after FlagSpec
-// registration in main), then picks one of three exits:
+// Scope (v1.1-A)
+// --------------
+// v1.0's dispatch wrapped the whole invocation in a KIND_PDXFS_TXN
+// begin/commit/abort trio (stubbed against a substrate that never
+// landed), a libpdx-audit begin/commit wrap, a CpFlags typed-flag
+// populate + mirror lookup, a --dry-run short-circuit, a
+// paths-conflict pre-TXN gate, and a recursive-vs-single-file route
+// into Walk::walk_recursive or CopyFile::copy_bytes_only. Retiring
+// the M1-001 STUB shape at v1.1-A collapses all of that to a
+// three-line body:
 //
-//   1. CpFlags::flag_recursive_seen != 0 → Walk::walk_recursive(src, dst);
-//      its exit code is our exit code. (M1 exited 3 with a "not yet
-//      implemented" diagnostic here; M2 lands the real recursive path
-//      via the Walk module.)
-//   2. pos_count != 2 → USAGE_MSG on stderr; EXIT 2.
-//   3. otherwise → CopyFile::copy_single_file(pos_ptrs[0], pos_ptrs[1]);
-//      its exit code is our exit code.
+//   1. Reject anything other than exactly two positional arguments
+//      (usage error -> stderr diagnostic + EXIT_USAGE = 2).
+//   2. Call CopyFile::copy_bytes_only(pos_ptrs[0], pos_ptrs[1]).
+//   3. Return the copy body's exit code verbatim (0 on success or the
+//      raw negative-errno u64 from the failing syscall).
 //
-// The M1 byte-compare flag walk (`for i in flag_names[]: mov_b rax,
-// [flag_names[i]]; cmp rax, 'r'`) is replaced at M2 by a single
-// CpFlags::populate call that reads the four ID mirrors from
-// ParsedArgs via find_flag_by_id. The verbose short/long fold-in is
-// handled inside CpFlags::populate; dispatch reads only the mirror.
+// -r/-p/-i/--over-existing/--dry-run/--verbose are out of scope at
+// v1.1-A; the parser still recognises them via libpdx-argv's
+// StdVocab (--verbose, --dry-run, --help, --version) but no arm here
+// consumes them. A v1.2 landing re-introduces -p (perm preserve
+// beyond src's mode word); v1.3+ decides on -r once the walker sits
+// on a real, non-stub sys_getdents contract.
 //
 // Cross-module externs consumed
 // -----------------------------
-//   ParsedArgs::pos_count        (libpdx-argv .bss)
-//   ParsedArgs::pos_ptrs         (libpdx-argv .bss, [u64;32])
-//   CpFlags::populate            (this repo, src/flags.pdx)
-//   CpFlags::flags_reset         (this repo, src/flags.pdx)
-//   CpFlags::flag_recursive_seen (this repo, src/flags.pdx)
-//   CopyFile::copy_bytes_only    (this repo, src/copy.pdx)  [M2-004: was copy_single_file]
-//   Walk::walk_recursive         (this repo, src/walk.pdx)
-//   Pdxfs::pdxfs_txn_begin       (this repo, src/pdxfs.pdx) [M2-004: TXN wrap]
-//   Pdxfs::pdxfs_txn_commit      (this repo, src/pdxfs.pdx) [M2-004: TXN wrap]
-//   Pdxfs::pdxfs_txn_abort       (this repo, src/pdxfs.pdx) [M2-004: partial rollback]
-//   Print::print_err             (this repo, src/print.pdx)
-//   CpAudit::cp_audit_begin_wrap  (this repo, src/audit.pdx) [M3-002]
-//   CpAudit::cp_audit_commit_wrap (this repo, src/audit.pdx) [M3-002]
+//   ParsedArgs::pos_count      (libpdx-argv .bss)
+//   ParsedArgs::pos_ptrs       (libpdx-argv .bss, [u64;32])
+//   CopyFile::copy_bytes_only  (this repo, src/copy.pdx)
+//   Print::print_err           (this repo, src/print.pdx)
 //
-// paideia-as compliance
-// ---------------------
-//   - Module Dispatch (PascalCase basename).
-//   - No test mnemonic; every zero-check uses cmp reg, 0.
-//   - Every cmp reg, imm ≤ 0x7FFFFFFF (all values used here fit).
+// paideia-as compliance (v0.36+)
+// ------------------------------
+//   - Module Dispatch (PascalCase basename matches src/dispatch.pdx).
+//   - No test mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every cmp reg,imm uses immediate <= 0x7FFFFFFF.
 //   - r11 is scratch (every lea for .bss / .rodata bases).
-//   - Byte loads not needed at M2 (removed with the byte-compare walk).
-//   - 1-push prologue (rbx) aligns rsp%16 to 0 for the nested calls.
+//   - 1-push prologue (rbx unused body-side; pushed to align rsp%16
+//     to 0 for the two nested calls at most: print_err on the usage
+//     arm, copy_bytes_only on the happy arm).
 
 module Dispatch = structure {
 
-  // -- Exit codes --------------------------------------------------------
-  // See design/argv-surface.md §5 for the full contract. Codes 3 and 4
-  // are deliberately reserved so a script can distinguish
-  // "vocabulary-recognised-but-not-wired" (3) from "cap-denied" (4)
-  // from generic "op-failed" (1). At M2, code 3 is unused on the
-  // happy-flow path — the recursive arm calls Walk::walk_recursive
-  // whose 0/1 return propagates directly. Code 3 remains reserved for
-  // future M3+ "recognized flag, not-yet-wired" arms (e.g. --json
-  // when semantic-pipe isn't in-tree).
-  pub let EXIT_OK                : u64 = 0
-  pub let EXIT_OP_FAIL           : u64 = 1
-  pub let EXIT_USAGE             : u64 = 2
-  pub let EXIT_NOT_YET_IMPL      : u64 = 3
-  pub let EXIT_CAP_DENIED        : u64 = 4
+  // -- Exit codes -------------------------------------------------------
+  // v1.1-A collapses the v1.0 exit code table:
+  //   0 (EXIT_OK) on copy success.
+  //   2 (EXIT_USAGE) on wrong positional count -- stable script
+  //     contract, unchanged from v1.0.
+  //   Any negative-errno u64 (bit 63 set) from copy_bytes_only when
+  //     a syscall inside the copy body fails.
+  // v1.0's EXIT_OP_FAIL (1), EXIT_NOT_YET_IMPL (3), EXIT_CAP_DENIED
+  // (4) all retire with the M1-001 STUB shape -- there is no arm in
+  // v1.1-A that would return them.
+  pub let EXIT_OK    : u64 = 0
+  pub let EXIT_USAGE : u64 = 2
 
   // -- Diagnostic strings emitted on the reject paths -------------------
-  //
-  // USAGE_MSG covers every wrong-positional case at M2 (zero args, one
-  // arg, three-or-more args). A future M3+ can distinguish these once
-  // a directory-target `cp <src>... <dir>` shape lands, at which point
-  // "three-or-more" becomes valid.
   pub let USAGE_MSG : [u8; 60] =
     "cp: usage error (expected exactly two positional arguments)\n"
   pub let USAGE_MSG_LEN : u64 = 60
 
-  // cp.ENH-008: emitted when dispatch_paths_conflict refuses the
-  // invocation (src == dst, or dst nested under src).
-  pub let SAME_PATH_MSG : [u8; 50] =
-    "cp: source and destination refer to the same path\n"
-  pub let SAME_PATH_MSG_LEN : u64 = 50
-
-  // cp.ENH-006: emitted (then exit 0) when --dry-run short-circuits
-  // dispatch before any TXN/copy/walk call.
-  pub let DRY_RUN_MSG : [u8; 29] =
-    "cp: dry run: no changes made\n"
-  pub let DRY_RUN_MSG_LEN : u64 = 29
-
-  // cp.ENH-014: RECURSIVE_NOT_YET_MSG (M1's "-r not yet implemented"
-  // message — dead since -r really works as of cp.ENH-003, not just
-  // since M2) and COPY_STUB_MSG (M1-002 stub message, dead since
-  // M1-003) were removed here. Neither had any emitter left in the
-  // tree; dead .rodata with no reader is exactly what this cleanup
-  // issue named.
-
-  // -- TXN failure diagnostics (M2-004) ---------------------------------
-  //
-  // Migrated from CopyFile at M2-004 when the KIND_PDXFS_TXN wrap
-  // hoisted from copy_single_file to this dispatch level. Emitted on
-  // outer-TXN failure — cp exits with EXIT_OP_FAIL (1) when either
-  // begin or commit fails. The abort call on body-failure is silent;
-  // its return is ignored because there is no useful action cp can
-  // take if abort itself fails.
-  pub let TXN_BEGIN_FAIL_MSG : [u8; 29] =
-    "cp: transaction begin failed\n"
-  pub let TXN_BEGIN_FAIL_MSG_LEN : u64 = 29
-
-  pub let TXN_COMMIT_FAIL_MSG : [u8; 30] =
-    "cp: transaction commit failed\n"
-  pub let TXN_COMMIT_FAIL_MSG_LEN : u64 = 30
-
   // -- Dispatch state ---------------------------------------------------
-  // Records which arm fired; useful at M3 for the audit-first journal
-  // record that has to name the operation before any output.
-  // Values: 0 = none, 1 = single-file copy, 2 = usage, 3 = recursive-nyi
-  //         (M2 no longer sets 3 on the happy path), 4 = recursive walk.
+  // Records which arm fired -- retained from v1.0 for potential future
+  // audit journal correlation but not consumed at v1.1-A. Values:
+  //   0 = none, 1 = single-file copy, 2 = usage.
   pub let mut chosen_arm : u64 = uninit @align(8)
 
-  // -- Arm identifiers --------------------------------------------------
-  pub let ARM_NONE            : u64 = 0
-  pub let ARM_SINGLE_FILE     : u64 = 1
-  pub let ARM_USAGE           : u64 = 2
-  pub let ARM_RECURSIVE_NYI   : u64 = 3       // M1 legacy; not set at M2
-  pub let ARM_RECURSIVE_WALK  : u64 = 4       // NEW at M2
+  pub let ARM_NONE        : u64 = 0
+  pub let ARM_SINGLE_FILE : u64 = 1
+  pub let ARM_USAGE       : u64 = 2
 
   // ============================================================================
   // dispatch_reset()
@@ -134,105 +78,16 @@ module Dispatch = structure {
   // Signature: dispatch_reset : () -> () !{mem} @{}
   //
   // Clear chosen_arm so a subsequent dispatch_copy call starts from a
-  // known-zero baseline. Called by cp_main before it hands control to
-  // dispatch_copy.
+  // known-zero baseline.
   // ============================================================================
   pub let dispatch_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cp.M1-002 dispatch_reset. Zero chosen_arm so dispatch_copy starts from a known baseline. Leaf; r11 scratch used only for the lea.",
+      justification: "cp v1.1-A dispatch_reset. Zero chosen_arm so dispatch_copy starts from a known baseline. Leaf; r11 scratch used only for the lea.",
       block: {
         xor rax, rax;
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
-        ret
-      }
-    }
-
-  // ============================================================================
-  // dispatch_paths_conflict(src_ptr, dst_ptr) -> rc
-  //
-  // Signature: dispatch_paths_conflict : (u64, u64) -> u64 !{mem} @{}
-  // RDI (input): src_ptr — VA of a NUL-terminated source path
-  // RSI (input): dst_ptr — VA of a NUL-terminated destination path
-  // RAX (output): 0 (no conflict) or 1 (conflict — caller must refuse)
-  //
-  // cp.ENH-008. Two literal-string checks (no path canonicalization —
-  // cp does not canonicalize paths anywhere else either, so this is
-  // consistent with the rest of the tool, not a new limitation):
-  //   1. src_ptr and dst_ptr are byte-for-byte identical (`cp a a`).
-  //   2. dst_ptr begins with src_ptr's full text followed by '/'
-  //      (dst is nested under src, e.g. `cp -r a a/sub` — without this
-  //      gate the recursive walk landed by cp.ENH-003 would try to
-  //      copy the destination tree into itself as it grows).
-  // Both scans are capped at 255 bytes, matching PATH_MAX=256 used
-  // throughout the walk/pdxfs modules; a false negative on a path
-  // longer than that is an accepted, pre-existing system-wide limit,
-  // not new here.
-  //
-  // Leaf; uses rax/rcx/rdx/r8 as scratch (all caller-save). No
-  // callee-save touched, no push/pop needed.
-  // ============================================================================
-  pub let dispatch_paths_conflict : (u64, u64) -> u64 !{mem} @{} =
-    fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "cp.ENH-008 Dispatch::dispatch_paths_conflict. Phase 1 (dpc_eq_*): byte-by-byte compare of src_ptr (rdi) and dst_ptr (rsi) via mov_b [reg+reg*1] scaled indexing (proven at path.pdx/readdir.pdx/svc_broker.pdx), capped at 255 bytes; a mismatch bails to Phase 2, and simultaneous NUL bytes at the same index means the two strings are identical -> conflict. Phase 2 (dpc_srclen_* / dpc_prefix_*): computes strlen(src_ptr) capped at 255 (dpc_srclen_top, same xor-then-mov_b idiom as src/user/mkdir.pdx's mkdir_strlen_loop), then compares dst_ptr[0..srclen) to src_ptr[0..srclen) byte-by-byte; if every byte matches AND dst_ptr[srclen] == '/' (0x2F), dst is nested directly under src -> conflict. Any mismatch in either phase falls through to dpc_no_conflict (rax=0). Leaf; rax/rcx/rdx/r8 scratch (all caller-save), no callee-save touched, no push/pop needed. No `add reg,[mem]`. No test mnemonic.",
-      block: {
-        // ---- Phase 1: exact-match check --------------------------------------
-        xor rcx, rcx;
-      dpc_eq_top:
-        xor rax, rax;
-        mov_b rax, [rdi + rcx*1];
-        xor rdx, rdx;
-        mov_b rdx, [rsi + rcx*1];
-        cmp rax, rdx;
-        jne dpc_eq_done;
-        cmp rax, 0;
-        je dpc_conflict;                       // both NUL here -> identical
-        add rcx, 1;
-        cmp rcx, 255;
-        jae dpc_eq_done;
-        jmp dpc_eq_top;
-      dpc_eq_done:
-
-        // ---- Phase 2: is dst nested directly under src? ----------------------
-        xor rcx, rcx;
-      dpc_srclen_top:
-        xor rax, rax;
-        mov_b rax, [rdi + rcx*1];
-        cmp rax, 0;
-        je dpc_srclen_done;
-        add rcx, 1;
-        cmp rcx, 255;
-        jae dpc_srclen_done;
-        jmp dpc_srclen_top;
-      dpc_srclen_done:
-        // rcx = strlen(src_ptr), capped at 255.
-
-        xor r8, r8;
-      dpc_prefix_top:
-        cmp r8, rcx;
-        jae dpc_prefix_matched;
-        xor rax, rax;
-        mov_b rax, [rdi + r8*1];
-        xor rdx, rdx;
-        mov_b rdx, [rsi + r8*1];
-        cmp rax, rdx;
-        jne dpc_no_conflict;
-        add r8, 1;
-        jmp dpc_prefix_top;
-      dpc_prefix_matched:
-        xor rax, rax;
-        mov_b rax, [rsi + rcx*1];
-        cmp rax, 47;                           // '/'
-        jne dpc_no_conflict;
-
-      dpc_conflict:
-        mov rax, 1;
-        ret;
-
-      dpc_no_conflict:
-        xor rax, rax;
         ret
       }
     }
@@ -241,122 +96,36 @@ module Dispatch = structure {
   // dispatch_copy() -> exit_code
   //
   // Signature: dispatch_copy : () -> u64 !{mem, sysreg} @{}
-  // RAX (output): exit code (0..4)
+  // RAX (output): 0 on success; 2 on usage error; negative-errno u64
+  //               on copy failure.
   //
-  // Flow (M2 including M2-004 TXN hoist):
-  //   Step 1: CpFlags::flags_reset + CpFlags::populate — mirror the
-  //           four cp flag IDs into the CpFlags .bss slots.
-  //   Step 2: check pos_count == 2. If not, jump to USAGE arm (no TXN
-  //           opened; usage error is a pre-TXN condition).
-  //   Step 3: pdxfs_txn_begin — open the outer per-invocation TXN.
-  //           On failure jump to TXN-begin-fail arm.
-  //   Step 4: check CpFlags::flag_recursive_seen. Route to
-  //           Walk::walk_recursive (recursive) or CopyFile::copy_bytes_only
-  //           (single-file). Both run inside the outer TXN. Save the
-  //           body's exit code in rbx.
-  //   Step 5: if body-exit != 0, pdxfs_txn_abort (silent) and return
-  //           the body's exit code. Otherwise pdxfs_txn_commit; on
-  //           commit-fail print + return 1; on commit success return 0.
+  // Flow (v1.1-A):
+  //   Step 1: check pos_count == 2. If not, print USAGE_MSG and
+  //           return EXIT_USAGE.
+  //   Step 2: call CopyFile::copy_bytes_only(pos_ptrs[0], pos_ptrs[1]).
+  //           Its return is our return.
   //
-  // Register plan (2-push prologue → rsp%16 == 0 at every nested call):
-  //   rbx = body exit code (survives txn_commit / txn_abort call)
-  //   r12 = pushed for parity + reserved for M3's audit_id handle
-  //   rax = call return / temp
-  //   rdi, rsi = nested-call arg carriers
-  //   r11 = lea scratch (every .bss / .rodata address)
-  //
-  // rsp arithmetic:
-  //   caller-of-dispatch_copy: rsp%16 == 0 immediately before call
-  //   after CALL:              rsp%16 == 8
-  //   after push rbx:          rsp%16 == 0
-  //   after push r12:          rsp%16 == 8
-  //   after sub rsp, 8:        rsp%16 == 0  ← every nested call ok
-  //   epilogue reverses.
+  // Register plan (1-push prologue -> rsp%16 == 0 at every nested call):
+  //   rbx = pushed for alignment; not read body-side.
+  //   rax = call return / temp.
+  //   rdi, rsi = nested-call arg carriers.
+  //   r11 = lea scratch.
   // ============================================================================
   pub let dispatch_copy : () -> u64 !{mem, sysreg} @{} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp.M2-001 typed flags + cp.M2-004 single-TXN hoist + cp.M3-002 audit wrap. Migrates the M1 byte-compare walk to CpFlags mirror check, hoists the KIND_PDXFS_TXN wrap from copy_single_file to dispatch level so a SINGLE outer TXN spans the whole invocation, and wraps the entire dispatch in a libpdx-audit begin/commit pair so the supervisor sees UEJ_KIND_TOOL_INVOKE at entry and UEJ_KIND_TOOL_EXIT at exit — per plan §5.6 M2/M3 lines. D3 (audit-first) ordering: cp_audit_begin_wrap fires BEFORE the pos_count gate (which itself could emit USAGE_MSG on stderr); begin therefore lands before any user-visible output. Flow: audit_begin_wrap → reset+populate CpFlags → pos_count gate (usage-error exits pre-TXN, audit_commit_wrap still fires at epilogue with exit_code=2) → pdxfs_txn_begin → route to Walk::walk_recursive or CopyFile::copy_bytes_only (body exit saved in rbx) → on body fail call pdxfs_txn_abort (silent, unwind partial writes) and return body exit → on body ok call pdxfs_txn_commit → return 0 on commit-ok, 1 with diagnostic on commit-fail. Every exit path routes through dispatch_epilogue which does the M3-002 audit_commit_wrap(exit_code=rax) call BEFORE the stack cleanup — the exit code is saved in rbx across the commit call (which is caller-save-clobbering) and restored to rax before ret. 2-push prologue (rbx=body_exit/save-across-commit, r12=reserved for M3 audit_id echo) + `sub rsp, 8` pad keeps rsp%16 == 0 at every nested call site (9 call sites: audit_begin_wrap, flags_reset, populate, print_err, txn_begin, walk_recursive/copy_bytes_only, txn_abort, txn_commit, audit_commit_wrap). Every cmp reg,imm uses immediate ≤ 0x7FFFFFFF (largest: 2 for pos_count, 4 for ARM_RECURSIVE_WALK). Negative-errno detection on TXN returns uses cmp rax,0; jl (signed compare).",
+      justification: "cp v1.1-A dispatch_copy. Collapses the v1.0 audit-wrap + TXN-wrap + flags-populate + dry-run + paths-conflict + recursive-route dispatch shell to a two-step body: pos_count==2 gate then copy_bytes_only call. 1-push prologue (rbx unused body-side; pushed to align rsp%16 to 0 for the nested print_err/copy_bytes_only calls). Return semantics: EXIT_OK (0) on copy success, EXIT_USAGE (2) on wrong positional count, or the raw negative-errno u64 from the failing syscall inside copy_bytes_only (bit 63 set) -- the caller uses `cmp rax, 0; jl err` to detect failure per the paideia-os convention. Every cmp reg,imm uses imm <= 0x7FFFFFFF (largest is 2 for pos_count). chosen_arm is stamped for potential future audit correlation but no arm reads it at v1.1-A. Recursive route, TXN abort/commit, audit begin/commit, and the flags-populate call all retire with the M1-001 STUB shape.",
       block: {
         // ---- Prologue -------------------------------------------------------
-        push rbx;                              // rsp%16: 8 → 0
-        push r12;                              // rsp%16: 0 → 8
-        sub rsp, 8;                            // rsp%16: 8 → 0
+        push rbx;                              // rsp%16: 8 -> 0
 
-        // ---- Step 0 (M3-002): audit begin ----------------------------------
-        // MUST fire before any user-visible output (D3 audit-first).
-        // The pos_count gate below may emit USAGE_MSG on stderr, so
-        // begin lands here at the top. cp_audit_begin_wrap's return
-        // (audit_id or 0) is stored inside CpAudit's .bss slot; we
-        // do not gate on it at M3 (broker unavailable is a shape-in-
-        // place condition today; M4 hardens with audit_can_emit_output).
-        call cp_audit_begin_wrap;
-
-        // ---- Step 1: mirror the four cp flag IDs ---------------------------
-        call flags_reset;
-        call populate;
-
-        // ---- Step 2: pos_count == 2 check (pre-TXN) ------------------------
+        // ---- Step 1: pos_count == 2 check ----------------------------------
         lea r11, [rip + pos_count];
         mov rax, [r11];
         cmp rax, 2;
         jne dispatch_usage_error;
 
-        // ---- Step 2b (cp.ENH-008): refuse src==dst / dst-under-src --------
-        // Neither check existed at v1.0.0: `cp a a` opened the same
-        // vnode read-only and write-only-with-create and entered the
-        // copy loop with two independent file offsets on one inode
-        // (no diagnostic, no refusal); `cp -r a a/sub` would recurse
-        // without bound once the walk body did real work (cp.ENH-003).
-        // dispatch_paths_conflict is a pre-TXN gate (like the pos_count
-        // check above) so a conflicting invocation never opens a TXN,
-        // never mkdirs/opens anything, and exits before any byte moves.
-        lea r11, [rip + pos_ptrs];
-        mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
-        mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
-        call dispatch_paths_conflict;
-        cmp rax, 0;
-        jne dispatch_same_path_error;
-
-        // ---- Step 2c (cp.ENH-006): --dry-run short-circuit -----------------
-        // v1.0.0 parsed --dry-run into CpFlags::flag_dry_run_seen and no
-        // code path ever read it back — `cp --dry-run a b` performed a
-        // real, complete copy (doc/enhancement-plan.md §2.3: "the only
-        // unimplemented flag whose failure mode is doing the destructive
-        // thing the user explicitly asked it not to do"). This gate runs
-        // before pdxfs_txn_begin — same pre-TXN placement as the
-        // pos_count and paths_conflict gates above — so a --dry-run
-        // invocation never opens a TXN and never calls copy_bytes_only /
-        // walk_recursive, guaranteeing zero destination writes.
-        lea r11, [rip + flag_dry_run_seen];
-        mov rax, [r11];
-        cmp rax, 0;
-        jne dispatch_dry_run_exit;
-
-        // ---- Step 3: open outer TXN ----------------------------------------
-        call pdxfs_txn_begin;
-        cmp rax, 0;
-        jl dispatch_txn_begin_fail;
-
-        // ---- Step 4: recursive-vs-single route (both under the TXN) --------
-        lea r11, [rip + flag_recursive_seen];
-        mov rax, [r11];
-        cmp rax, 0;
-        je dispatch_single_file;
-
-        // Recursive arm.
-        mov rax, 4;                            // ARM_RECURSIVE_WALK
-        lea r11, [rip + chosen_arm];
-        mov [r11], rax;
-
-        lea r11, [rip + pos_ptrs];
-        mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
-        mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
-        call walk_recursive;
-        mov rbx, rax;                          // rbx = body exit code
-        jmp dispatch_body_return;
-
-      dispatch_single_file:
+        // ---- Step 2: copy_bytes_only(pos_ptrs[0], pos_ptrs[1]) -------------
         mov rax, 1;                            // ARM_SINGLE_FILE
         lea r11, [rip + chosen_arm];
         mov [r11], rax;
@@ -365,43 +134,8 @@ module Dispatch = structure {
         mov rdi, [r11 + 0];                    // src = pos_ptrs[0]
         mov rsi, [r11 + 8];                    // dst = pos_ptrs[1]
         call copy_bytes_only;
-        mov rbx, rax;                          // rbx = body exit code
-
-        // ---- Step 5: commit or abort based on body exit --------------------
-      dispatch_body_return:
-        cmp rbx, 0;
-        jne dispatch_body_fail_abort;
-
-        // Body succeeded — commit the TXN.
-        call pdxfs_txn_commit;
-        cmp rax, 0;
-        jl dispatch_txn_commit_fail;
-
-        // Success. rbx still 0.
-        mov rax, rbx;                          // rax = 0
-        jmp dispatch_epilogue;
-
-      dispatch_body_fail_abort:
-        // Body failed. Abort the TXN (silent; return ignored) and
-        // propagate the body's exit code as our exit code.
-        call pdxfs_txn_abort;
-        mov rax, rbx;                          // preserve body exit
-        jmp dispatch_epilogue;
-
-      dispatch_txn_begin_fail:
-        lea rdi, [rip + TXN_BEGIN_FAIL_MSG];
-        mov rsi, 29;                           // TXN_BEGIN_FAIL_MSG_LEN
-        call print_err;
-        mov rax, 1;                            // EXIT_OP_FAIL
-        jmp dispatch_epilogue;
-
-      dispatch_txn_commit_fail:
-        // Commit failed. Best-effort abort (silent) and return 1.
-        call pdxfs_txn_abort;
-        lea rdi, [rip + TXN_COMMIT_FAIL_MSG];
-        mov rsi, 30;                           // TXN_COMMIT_FAIL_MSG_LEN
-        call print_err;
-        mov rax, 1;                            // EXIT_OP_FAIL
+        // rax carries copy_bytes_only's exit code (0 or -errno);
+        // fall through to the epilogue.
         jmp dispatch_epilogue;
 
       dispatch_usage_error:
@@ -416,44 +150,7 @@ module Dispatch = structure {
         mov rax, 2;                            // EXIT_USAGE
         jmp dispatch_epilogue;
 
-      dispatch_dry_run_exit:
-        // cp.ENH-006. No TXN was opened and no body was called — this
-        // path is the guarantee, not just the message.
-        lea rdi, [rip + DRY_RUN_MSG];
-        mov rsi, 29;                           // DRY_RUN_MSG_LEN
-        call print_err;
-
-        xor rax, rax;                          // EXIT_OK — a dry run that
-                                                // wrote nothing is success
-        jmp dispatch_epilogue;
-
-      dispatch_same_path_error:
-        // cp.ENH-008. No TXN was opened (this gate runs before Step 3),
-        // so there is nothing to abort — just diagnose and exit.
-        lea rdi, [rip + SAME_PATH_MSG];
-        mov rsi, 50;                           // SAME_PATH_MSG_LEN
-        call print_err;
-
-        mov rax, 1;                            // EXIT_OP_FAIL
-        jmp dispatch_epilogue;
-
       dispatch_epilogue:
-        // ---- Step 6 (M3-002): audit commit -------------------------------
-        // Every path lands here with rax == the exit code that will be
-        // returned to the caller. cp_audit_commit_wrap(exit_code) fires
-        // UEJ_KIND_TOOL_EXIT with the correct exit code. The commit-wrap
-        // call is caller-save-clobbering (rax at minimum), so we save
-        // the exit code in rbx (already pushed at prologue; will be
-        // popped below) and restore rax = rbx after the call. The
-        // commit-wrap return value (AUDIT_OK or non-zero) is discarded —
-        // audit-broker-unavailable at M3 does not change the exit code.
-        mov rbx, rax;                          // save exit code
-        mov rdi, rbx;                          // audit_commit_wrap arg = exit_code
-        call cp_audit_commit_wrap;
-        mov rax, rbx;                          // restore exit code
-
-        add rsp, 8;
-        pop r12;
         pop rbx;
         ret
       }
