@@ -1,9 +1,17 @@
 # cp
 
-paideia-os copy — atomic single-TXN file / directory-tree copy with
-cap-tail re-signing, audit-first journaling, semantic-pipe progress
-records, PdxFS undo on overwrite, and cross-subtree elevate for
-widening destination-parent writes.
+paideia-os copy — byte-faithful file copy over the R56/R86 PdxFS
+syscall surface. v1.1 is a five-syscall real body (open/read/write/
+close/stat) plus a userspace cwd resolve for slash-less destinations
+(v1.1-B). The v1.0-era outer-scaffolding story — single-invocation
+KIND_PDXFS_TXN wrap, cap-tail re-signing, audit-first journaling,
+semantic-pipe progress records, PdxFS undo on overwrite, cross-
+subtree elevate — was retired in v1.1-A because every one of those
+was a shape-in-place stub against a substrate that had not landed;
+see §"Atomicity status" below for the current honest picture and
+paideia-os/cp#35 for the tracking issue that re-wires the outer TXN
+against the R90 substrate now that sysnos 70 / 104 / 105 / 107 have
+landed on the kernel side.
 
 Install with `pkg install cp` (pulls the dual-signed 1.0.0 release from
 `pkgs.paideia-os/main/cp/1.0.0/`; `pkg` verifies both the author and the
@@ -26,16 +34,41 @@ libpdx-argv as `ERR_CLUSTERED_SHORT` and surfaces as a parse error.
 
 cp streams bytes from `<src>` to `<dst>` through a 4096-byte `.bss`
 scratch buffer (`CopyFile::copy_buf`), one `pdxfs_read` and one
-`pdxfs_write` per iteration until source EOF. The whole invocation —
-single-file or recursive — runs inside **one** `KIND_PDXFS_TXN`. Since
-M2-004 the transaction is opened at dispatch level, not per file:
-`dispatch_copy` calls `pdxfs_txn_begin` before routing, `pdxfs_txn_commit`
-when the body returns 0, and `pdxfs_txn_abort` on any non-zero body
-return, so a multi-file `-r` copy rolls back as a single unit. After a
-successful copy the body calls `SignedInode::preserve_at_destination` to
-re-sign the destination inode's cap tail; `SI_OK` and
-`SI_DEGRADED_KEY_LOCKED` are both success-continuation codes — the bytes
-land either way, only the signature differs.
+`pdxfs_write` per iteration until source EOF. That five-syscall body
+(`sys_open`/`sys_read`/`sys_write`/`sys_close`/`sys_stat`) plus the
+v1.1-B userspace cwd resolve (`sys_getcwd`) is the whole tool at
+v1.1 — the outer scaffolding shipped by v1.0 (KIND_PDXFS_TXN wrap,
+cap-tail re-signing, audit-first journaling, semantic-pipe progress
+records, PdxFS undo on overwrite, cross-subtree elevate) retired in
+v1.1-A because every one of those was a stub against a substrate
+that had not landed. See "Atomicity status" below for the
+implications on partial-copy visibility, and "Retired v1.0 surfaces"
+for what is no longer present and where each piece will land back.
+
+### Atomicity status (v1.1)
+
+**cp is NOT atomic at v1.1.** A mid-copy crash or `sys_write`
+failure between the destination's `O_CREAT|O_TRUNC` open and the
+final `sys_close` leaves the destination in whichever partial state
+the failing write settled — no rollback, no snapshot, no journal
+replay. `dispatch_copy` opens no transaction, `copy_bytes_only`
+issues no undo record, and `caps.decl` no longer declares
+`KIND_PDXFS_TXN` because no code path uses it. This mirrors POSIX
+cp's behaviour without WAL support and matches every currently
+shipping paideia-os copy tool.
+
+The kernel-side substrate the v1.0 story was designed against has
+since landed (`sys_pdxfs_txn_open` = sysno 70, `sys_pdxfs_txn_commit`
+= sysno 104, `sys_pdxfs_txn_abort` = sysno 105,
+`sys_pdxfs_undo_write` = sysno 107; see `design/user/syscall-table.md`
+in the paideia-os monorepo). Wiring cp back onto that substrate —
+adding a `KIND_PDXFS_VOL` cap to `caps.decl` for `pdxfs_txn_open`,
+staging per-write pre-image snapshots through `pdxfs_undo_write`,
+committing / aborting on the exit paths — is tracked as
+paideia-os/cp#35 (cp.ENH-011). Nothing in this release is a code
+change on that path; v1.1-C is purely a documentation-honesty pass
+so the tagline, description, and long-form `doc cp` stop asserting
+an atomicity guarantee cp does not currently deliver.
 
 Every invocation runs under the baseline capability row declared in
 `caps.decl`: `KIND_USER (self)`, `KIND_IPC_ENDPOINT (invoke)`,
@@ -172,8 +205,8 @@ Defined as `Dispatch::EXIT_*` in `src/dispatch.pdx`.
 
 | Code | Name | Meaning | Emitted today? |
 |------|------|---------|----------------|
-| 0 | `EXIT_OK` | Copy committed. | Yes — body returned 0 and `pdxfs_txn_commit` succeeded. |
-| 1 | `EXIT_OP_FAIL` | Operation failed: open-src, open-dst, read, write, short write, `mkdir`/`opendir`/`readdir` under `-r`, TXN begin failure, TXN commit failure. | Yes. |
+| 0 | `EXIT_OK` | Byte-loop reached source EOF and every `pdxfs_close` returned. There is no outer TXN commit at v1.1 (see "Atomicity status"); a `0` exit means only that no syscall inside the copy body reported an error, not that the destination is transactionally sealed. | Yes — body returned 0 from `copy_bytes_only`. |
+| 1 | `EXIT_OP_FAIL` | Reserved: no v1.1 code path assigns it. The v1.0 shape returned 1 for open/read/write/short-write plus TXN/walk/mkdir/readdir failures; v1.1's `copy_bytes_only` returns the raw negative-errno u64 (bit 63 set) from the failing syscall instead, so callers get the exact errno rather than a collapsed 1. | No. |
 | 2 | `EXIT_USAGE` | argv parse error (from `cp_main`) or `pos_count != 2` (from `dispatch_copy`). | Yes. |
 | 3 | `EXIT_NOT_YET_IMPL` | Reserved: "vocabulary recognised, body not wired". | No — no 1.0 code path returns it. |
 | 4 | `EXIT_CAP_DENIED` | Cap denied — the elevate broker refused (or is unreachable) on the destination-parent retry. | Yes — `copy_open_dst_cap_denied` prints `cp: elevate refused (dst-parent out of scope)` and returns 4. Since libpdx-elevate.M1 has no broker daemon running, every elevate attempt is refused today, so any dst-open failure that reaches the elevate retry currently ends in exit 4 rather than exit 1. |
@@ -202,15 +235,21 @@ pub let cp_audit_commit_wrap  : (u64) -> u64 !{mem, sysreg} @{cap, sched}
 pub let cp_pipe_emit_progress : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap}
 ```
 
-The `requires:` block of `caps.decl`:
+The `requires:` block of `caps.decl` at v1.1:
 
 ```
 - KIND_USER (self)
-- KIND_IPC_ENDPOINT (invoke)
 - KIND_PDXFS_FILE (read, <src>)
 - KIND_PDXFS_FILE (write, <dst-parent>)
-- KIND_PDXFS_TXN (invoke)
 ```
+
+v1.1-A retired `KIND_IPC_ENDPOINT (invoke)`, `KIND_PDXFS_TXN
+(invoke)`, and `KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)`
+alongside the outer TXN wrap, the semantic-pipe emit path, and the
+cross-subtree elevate retry — the caps are only re-declared when
+their consumers land back. `KIND_PDXFS_TXN` in particular returns
+under paideia-os/cp#35 alongside a new `KIND_PDXFS_VOL` for
+`pdxfs_txn_open`'s volume argument.
 
 ## Examples
 

@@ -1,6 +1,16 @@
 # cp -- paideia-as build manifest
 #
-# Wave: R50  Milestone: v1.1-B (userspace cwd-relative dst resolution)
+# Wave: R50  Milestone: v1.1-C (atomicity-claim retirement, doc-only)
+#
+# v1.1-C closes paideia-os/cp#23 (`cp.ENH-007 TXN begin/commit/abort
+# are no-ops while the docs assert atomicity as fact`). No source or
+# manifest surface changes: README.md, doc/cp.pdxdoc, and
+# design/pdxfs-notes.md are updated to state honestly that cp v1.1
+# is NOT transactionally atomic, that the outer KIND_PDXFS_TXN wrap
+# retired in v1.1-A, and that the R90 kernel substrate the outer
+# wrap will re-target (sysnos 70/104/105/107) is tracked as
+# paideia-os/cp#35 rather than landing at v1.1-C. See CHANGELOG.md
+# under 1.1.0-C for the audit.
 #
 # v1.1-B closes paideia-os/cp#21: the kernel's vfs_open O_CREAT
 # parent-scan refuses a slash-less create outright, so
@@ -29,7 +39,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step.
 
 name        = cp
-version     = 1.1.0-B
+version     = 1.1.0-C
 kind        = tool
 entry       = Main::cp_main
 output      = build-out/cp

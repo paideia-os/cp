@@ -7,6 +7,92 @@ and every issue it lands, so the release-tag ↔ code-tree ↔ issue-
 graph triangulation the signing pipeline uses at `paideia-as
 release --sign` time is reproducible from this file alone.
 
+## 1.1.0-C — 2026-09-12 (atomicity-claim retirement, doc-only)
+
+Closes paideia-os/cp#23 (`cp.ENH-007 TXN begin/commit/abort are
+no-ops while the docs assert atomicity as fact`).
+
+**Doc-only release.** No source file changes, no manifest surface
+changes beyond the version bump, no build reshape. v1.1-A retired
+the `pdxfs_txn_begin` / `pdxfs_txn_commit` / `pdxfs_txn_abort`
+trampolines out of `src/pdxfs.pdx` and dropped the outer
+begin/commit/abort wrap out of `src/dispatch.pdx::dispatch_copy`;
+`caps.decl` dropped `KIND_PDXFS_TXN (invoke)` in the same release.
+The tagline, the README Description section, the `doc/cp.pdxdoc`
+§3 / §6 / §8 renders, and the design/pdxfs-notes.md substrate
+audit did not get updated at the time and continued to assert
+single-invocation transactional atomicity as a v1.1 property. This
+release brings all four documents into line with what v1.1-A
+actually shipped.
+
+### Changed
+
+- `README.md` — tagline drops "atomic single-TXN" (v1.1 is not
+  atomic); the Description section drops the `dispatch_copy calls
+  pdxfs_txn_begin/commit/abort` paragraph and adds a new
+  "Atomicity status (v1.1)" section that names the current
+  behaviour honestly ("cp is NOT atomic at v1.1"), catalogues the
+  kernel substrate that has since landed (sysnos 70 / 104 / 105 /
+  107), and points at paideia-os/cp#35 for the re-wire; the exit-
+  code table row for `EXIT_OK` drops the `pdxfs_txn_commit
+  succeeded` clause and the `EXIT_OP_FAIL` row is marked as no
+  longer emitted at v1.1 (`copy_bytes_only` returns raw negative-
+  errno u64 instead); the Capabilities section drops the
+  `KIND_PDXFS_TXN (invoke)` row from the `caps.decl` example (it
+  is not in `caps.decl` at v1.1).
+- `doc/cp.pdxdoc` — `@version` bumped to 1.1.0-C; the `@one-liner`
+  drops "with per-file cap re-signing" (retired at v1.1-A); §1
+  Name loses the "WIRED for single-invocation transactional
+  atomicity" claim; §3 Description drops the "wraps the whole
+  invocation in one pdxfs_txn_begin/commit/abort triple" paragraph
+  and adds an "atomicity status" paragraph that names the current
+  behaviour honestly and points at paideia-os/cp#35; §6
+  Capabilities drops the `KIND_IPC_ENDPOINT (invoke)` and
+  `KIND_PDXFS_TXN (invoke)` lines and the elevate-retry paragraph;
+  §8 Audit + undo drops the libpdx-audit and undo-record
+  paragraphs and states plainly that cp v1.1 writes no audit
+  record and persists no undo record.
+- `design/pdxfs-notes.md` — new §5c v1.1-C addendum records the
+  full R90 kernel substrate landing (sysnos 70 / 104 / 105 / 107
+  with body-handler paths), states plainly that v1.1-C is doc-only
+  and does not wire cp onto the substrate, and points at paideia-
+  os/cp#35 (cp.ENH-011) for the substrate half of paideia-os/cp#23.
+- `manifest.pdxproj` — `version = 1.1.0-B` -> `version = 1.1.0-C`;
+  header comment describes the doc-only shape.
+
+### Not changed
+
+- `src/pdxfs.pdx` — six real trampolines only (open / read / write
+  / close / stat / getcwd). No TXN trampolines were added at
+  v1.1-C; they land under paideia-os/cp#35 alongside the
+  substrate re-wire.
+- `src/dispatch.pdx` — v1.1-A's `dispatch_copy` two-step body (pos-
+  count gate + `copy_bytes_only` call) is unchanged. No outer TXN
+  wrap was re-introduced at v1.1-C.
+- `caps.decl` — v1.1-A's three-cap `requires:` block (`KIND_USER`,
+  `KIND_PDXFS_FILE (read, <src>)`, `KIND_PDXFS_FILE (write,
+  <dst-parent>)`) is unchanged. `KIND_PDXFS_TXN (invoke)` and a
+  new `KIND_PDXFS_VOL` for `pdxfs_txn_open`'s volume argument land
+  under paideia-os/cp#35.
+- All source `.pdx` files, `manifest.pdxsig`, `tests/*.md`, and
+  every other file not named in "Changed" are byte-identical to
+  v1.1-B.
+
+### Follow-up
+
+- paideia-os/cp#35 (cp.ENH-011) — re-wire the outer TXN against
+  the R90 kernel substrate that has since landed (sysnos 70 / 104
+  / 105 / 107). Requires: (a) a `KIND_PDXFS_VOL` cap grant added
+  to `caps.decl` and threaded through the InitCap sidecar for
+  `pdxfs_txn_open(vol_slot, flags)`; (b) per-write pre-image
+  snapshot marshaling through `pdxfs_undo_write(cap_slot, inode_no,
+  offset, len, kbuf_ptr)` with per-row cap awareness (32 records /
+  4 KiB per the R90 substrate — a large-file copy needs commit-
+  and-reopen batching); (c) commit-on-success and abort-on-error
+  plumbing on every exit path out of `copy_bytes_only`; (d) a new
+  test row in `tests/M4-001-txn-abort.md` shape that exercises
+  the abort path under a forced mid-copy failure.
+
 ## 1.1.0-B — 2026-09-12 (userspace cwd-relative dst resolution)
 
 Closes paideia-os/cp#21 (`cp.ENH-005 cp <src> <bare-name> fails:

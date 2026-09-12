@@ -177,6 +177,48 @@ Table 5b: v1.1-B sysno additions.
 | `77`  | `sys_stat`    | `src/kernel/core/syscall/handlers/sys_stat.pdx`  (R56.M3-002) |
 | `86`  | `sys_getcwd`  | `src/kernel/core/syscall/sys_getcwd.pdx`         (R86.M1-003) |
 
+## 5c. v1.1-C addendum — TXN scaffolding retirement audit (cp#23)
+
+**Wave:** R50  Milestone: v1.1-C (2026-09-12).
+
+The M1 §4 "two TXN stubs" plan is historical. v1.1-A retired the
+`pdxfs_txn_begin` / `pdxfs_txn_commit` / `pdxfs_txn_abort`
+trampolines out of `src/pdxfs.pdx` entirely and dropped the outer
+begin/commit/abort wrap out of `src/dispatch.pdx::dispatch_copy` —
+the whole M1-001 STUB shape retired at v1.1-A as one atomic
+decision because every hook in that shape was a stub against a
+substrate that had not landed at the time. `caps.decl` dropped
+`KIND_PDXFS_TXN (invoke)` in the same release.
+
+**Where the substrate stands now.** The kernel-side syscalls the
+M1 §4 plan was waiting on have landed after v1.1-A shipped:
+
+| sysno | Name                    | Body handler at                                                       |
+|-------|-------------------------|-----------------------------------------------------------------------|
+| `70`  | `sys_pdxfs_txn_open`    | `src/kernel/core/syscall/handlers/sys_pdxfs_txn_open.pdx`   (R42-PREP-007 / paideia-os #1629) |
+| `104` | `sys_pdxfs_txn_commit`  | `src/kernel/core/syscall/handlers/sys_pdxfs_txn_commit.pdx` (R90-XREPO.010.M1-003 / paideia-os #2111) |
+| `105` | `sys_pdxfs_txn_abort`   | `src/kernel/core/syscall/handlers/sys_pdxfs_txn_abort.pdx`  (R90-XREPO.010.M1-003 / paideia-os #2111) |
+| `107` | `sys_pdxfs_undo_write`  | `src/kernel/core/syscall/handlers/sys_pdxfs_undo_write.pdx` (R90-XREPO.010.M1-004 / paideia-os #2112) |
+
+The four-syscall set is the full R90-XREPO.010 TXN lifecycle plus
+undo record write; see `design/user/syscall-table.md` in the
+paideia-os monorepo for the ABI reference. v1.1-C does NOT wire cp
+onto them — that is a bounded but non-trivial re-scaffold (new
+`KIND_PDXFS_VOL` cap grant for `pdxfs_txn_open`, per-write
+pre-image marshaling into `pdxfs_undo_write`, commit/abort branch
+plumbing on every exit path) and lands as its own release under
+paideia-os/cp#35 (cp.ENH-011).
+
+**Why v1.1-C is doc-only.** paideia-os/cp#23 filed the mismatch
+between the `doc/cp.pdxdoc` §3 / §8 atomicity assertions and the
+v1.1-A code that had already retired the TXN wrap. The issue split
+into an honesty half (retire the atomicity claim in the docs so
+the release-notes ↔ code-tree ↔ doc-render triangulation the
+signing pipeline verifies at `paideia-as release --sign` time
+stays consistent) and a substrate half (re-wire the outer TXN
+against the R90 syscalls now that they exist). This addendum
+closes the honesty half; the substrate half lives on cp#35.
+
 ## 6. What M1 does NOT talk to yet
 
 - No `sys_svc_lookup` (sysno 43). cp does not need the elevate-broker

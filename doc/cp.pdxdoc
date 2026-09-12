@@ -14,17 +14,24 @@
 
 @doc-format-version 1
 @tool cp
-@version 1.0.0
-@one-liner Copy a file or a directory tree, with per-file cap re-signing.
+@version 1.1.0-C
+@one-liner Copy a single file over the R56/R86 PdxFS syscall surface (not atomic at v1.1).
 
 @section 1. Name
 
 @para
-cp — copy a file or a directory tree, with per-file capability
-re-signing. cp is WIRED for single-invocation transactional
-atomicity and a PdxFS undo record on overwrite, but neither
-guarantee is real yet — see §3 for exactly which kernel syscalls are
-still missing.
+cp — copy a single file from `<src>` to `<dst>` over the R56/R86
+PdxFS syscall surface (open/read/write/close/stat + v1.1-B
+sys_getcwd for slash-less destinations). cp is NOT transactionally
+atomic at v1.1 and does NOT persist a PdxFS undo record on
+overwrite; every outer-wrap scaffolding piece the v1.0-era doc
+claimed (KIND_PDXFS_TXN begin/commit/abort trio, cap-tail re-
+signing, audit-first journaling, semantic-pipe progress records,
+--over-existing undo journalling, cross-subtree elevate) retired in
+v1.1-A because every one of those was a stub against a substrate
+that had not landed. See §3 for the current honest picture and
+paideia-os/cp#35 for the tracking issue that re-wires the outer TXN
+against the R90 substrate that has since landed on the kernel side.
 
 @section 2. Synopsis
 
@@ -41,50 +48,47 @@ the destination is the parent directory of the target tree. When
 @section 3. Description
 
 @para
-cp wraps the whole invocation (single-file, or every entry of a
-`cp -r` tree) in one `pdxfs_txn_begin` / `pdxfs_txn_commit` /
-`pdxfs_txn_abort` triple, and every failure inside the copy or walk
-body routes through the abort call before cp exits. This is the
-INTENDED atomicity design — the wiring is real — but as of this
-writing the paideia-os kernel exposes only `sys_pdxfs_txn_open`
-(sysno 70); no commit/abort syscall ordinal is exposed yet, so all
-three trampolines are still no-op stubs (`pdxfs_txn_begin` /
-`_commit` return 0 unconditionally; `pdxfs_txn_abort` likewise).
-**The atomicity guarantee is therefore not real yet**: a mid-copy
-crash today leaves whatever bytes had already been written, exactly
-like a copy with no transaction at all. This is a tracked paideia-os
-kernel dependency (not a cp defect) — cp is a body-edit away from the
-real guarantee the day `sys_pdxfs_txn_commit` / `_abort` land.
+cp v1.1 streams bytes from `<src>` to `<dst>` through a 4096-byte
+`.bss` scratch buffer (`CopyFile::copy_buf`), one `pdxfs_read` and
+one `pdxfs_write` per iteration until source EOF, then closes both
+descriptors. The whole tool at v1.1 is that five-syscall real body
+(`sys_open`, `sys_read`, `sys_write`, `sys_close`, `sys_stat`) plus
+the v1.1-B userspace cwd resolve (`sys_getcwd`) for slash-less
+destinations — see §Files. `dispatch_copy` opens no transaction,
+runs no audit hook, holds no semantic-pipe binding, records no
+undo, and attempts no cap-tail re-sign. Every one of those outer-
+wrap pieces the v1.0 shape shipped was retired in v1.1-A because
+every one of those was a stub against a substrate that had not
+landed; see §"Retired v1.0 surfaces" for the retirement audit.
 
 @para
-Every cp invocation also (a) journals a `CopyRecord` to the audit
-log before writing any bytes (D3 audit-first — the record is
-present even on failure), (b) emits `CopyProgressRecord[]` on its
-stdout fd bound to schema `CopyProgressRecord@0.1` (D2 semantic
-pipes — downstream `query`, `sort`, `pipeviz` consume the typed
-records without column-slicing text) for every file copied,
-whether via a plain `cp` or via `cp -r`'s per-entry walk, and
-(c) attempts to re-sign the destination inode's cap tail under
-the invoker's `user_sk` so ownership provenance survives the copy
-(`design/user/model.md` §10.2 signed-inode field). When the
-invoker's key is locked or the copy crosses user boundaries, the
-re-sign gracefully degrades; the file bytes still land and
-`--verbose` emits a one-line diagnostic naming the degrade cause.
+**cp is NOT atomic at v1.1.** A mid-copy crash, a `sys_write`
+short-write past cp's own retry loop, or any kernel-side failure
+between the destination's `O_CREAT | O_TRUNC` open and the final
+`sys_close` leaves the destination in whichever partial state the
+failing write settled — no rollback, no snapshot, no journal
+replay. This matches POSIX cp's behaviour without WAL support and
+matches every currently shipping paideia-os copy tool. The kernel
+substrate the v1.0 story was designed against has since landed
+(`sys_pdxfs_txn_open` = sysno 70, `sys_pdxfs_txn_commit` = sysno
+104, `sys_pdxfs_txn_abort` = sysno 105, `sys_pdxfs_undo_write` =
+sysno 107; see `design/user/syscall-table.md` in the paideia-os
+monorepo), but wiring cp back onto it — adding a `KIND_PDXFS_VOL`
+cap to `caps.decl` for `pdxfs_txn_open`'s volume argument, staging
+per-write pre-image snapshots through `pdxfs_undo_write`, and
+committing / aborting on the exit paths — is tracked as paideia-os/
+cp#35 (cp.ENH-011) and is not a v1.1-C code change.
 
 @para
 cp always opens the destination `O_WRONLY | O_CREAT | O_TRUNC` and
 overwrites an existing destination unconditionally — this matches
-POSIX cp's default-overwrite behavior; cp does NOT refuse an
-existing destination. `--over-existing` does not gate the write;
-it additionally attempts to journal a PdxFS v1 undo record of the
-pre-copy destination bytes before the overwrite so `undo cp
-<same-args>` can restore them. As of this writing the kernel-side
-`sys_pdxfs_undo_write` syscall the journal write needs is not yet
-exposed (tracked as a paideia-os dependency, not a cp defect), so
-`--over-existing` currently gates correctly (it detects whether the
-destination exists) but does not yet persist a real undo record —
-`undo cp <same-args>` will not restore anything until that syscall
-lands.
+POSIX cp's default-overwrite behaviour; cp does NOT refuse an
+existing destination and does NOT journal an undo record before the
+overwrite. `--over-existing` is not accepted at v1.1 (the flag
+retired with the undo path in v1.1-A); pass it and the argv parser
+rejects the invocation before the copy body runs. `undo cp
+<same-args>` has nothing to replay for a v1.1 copy — that recovery
+path returns alongside paideia-os/cp#35.
 
 @section 4. Options
 
@@ -146,29 +150,28 @@ for a future not-yet-implemented flag rather than removed outright.
 @section 6. Capabilities required
 
 @para
-Every cp invocation receives these caps from the loader's InitCap
-sidecar per `caps.decl`. The loader narrows the two file caps'
-scope to the argument path prefixes at exec — cp cannot read or
-write outside the source and destination-parent subtrees named on
-argv.
+Every cp v1.1 invocation receives these three caps from the
+loader's InitCap sidecar per `caps.decl`. The loader narrows the
+two file caps' scope to the argument path prefixes at exec — cp
+cannot read or write outside the source and destination-parent
+subtrees named on argv.
 
 @example
 KIND_USER              (self)
-KIND_IPC_ENDPOINT      (invoke)
 KIND_PDXFS_FILE        (read,  <src>)
 KIND_PDXFS_FILE        (write, <dst-parent>)
-KIND_PDXFS_TXN         (invoke)
 
 @para
-cp retries via a KIND_ELEVATE_CHANNEL request on EVERY destination
-open failure (M3 does not yet distinguish "cross-subtree" from any
-other open-failure cause). The request specifies the widened
-`KIND_PDXFS_FILE (write, <dst-parent>)` cap. libpdx-elevate.M1 has no
-broker daemon running yet, so at 1.0.x this retry is always refused
-— every elevate attempt today ends in `cp: elevate refused
-(dst-parent out of scope)` and exit 4, whether the real cause would
-have been "refused" or "broker unreachable"; the two are not yet
-distinguishable at cp's level.
+v1.1-A retired `KIND_IPC_ENDPOINT (invoke)`, `KIND_PDXFS_TXN
+(invoke)`, and `KIND_ELEVATE_CHANNEL (invoke, svc.elevate-broker)`
+alongside the outer TXN wrap, the semantic-pipe emit path, and the
+cross-subtree elevate retry — each cap is only re-declared when
+its consumer lands back. `KIND_PDXFS_TXN` (plus a new
+`KIND_PDXFS_VOL` for `pdxfs_txn_open`'s volume argument) returns
+under paideia-os/cp#35. No elevate retry runs at v1.1: a
+destination-parent open failure surfaces the raw negative-errno u64
+from `sys_open` directly as the tool's exit code (see §5) with the
+`cp: cannot open destination file` diagnostic.
 
 @section 7. Output schemas
 
@@ -198,24 +201,25 @@ inspection.
 @section 8. Audit + undo
 
 @para
-Every cp invocation writes an audit record via libpdx-audit before
-it writes any bytes (`audit_begin`) and seals it with the exit code
-at commit time (`audit_commit`) — the audit log names the attempt
-even when nothing landed. The "partial state rolled back at the TXN
-boundary" part of that seal is aspirational until the kernel-side
-TXN commit/abort syscalls land (see §3) — today the TXN wrap runs
-but the rollback it wraps around is a no-op.
+cp v1.1 writes NO audit record and persists NO PdxFS undo record.
+The libpdx-audit begin/commit wrap, the libpdx-semantic-pipe
+CopyProgressRecord emit, and the `--over-existing` undo-journal
+gate all retired in v1.1-A because every one of those was a stub
+against a substrate that had not landed — see §"Retired v1.0
+surfaces". Nothing at v1.1-C changes that: this release is a
+documentation-honesty pass, not a re-wiring pass.
 
 @para
-`--over-existing` correctly detects (via a real `pdxfs_stat` call,
-per §3) whether the destination already exists, but the PdxFS v1
-undo-journal WRITE itself (`sys_pdxfs_undo_write`) is not yet exposed
-by the kernel — this is the one piece of the M2-005 design that
-remains a stub. `undo cp <same-args>` therefore has nothing to
-replay yet: no undo record is actually persisted. Multi-file
-recursive copies will write one undo record per over-written
-destination once the syscall lands; `undo` will then replay them in
-reverse order.
+A mid-copy crash leaves whatever bytes had already been written
+(§3) with no journal entry naming the attempt, no undo record
+enabling a `undo cp <same-args>` roll-back, and no audit trail
+recording that cp was invoked. Every one of those surfaces returns
+on the same paideia-os/cp#35 milestone that re-wires the outer TXN,
+because the invariants only make sense together (a discoverability
+record without a rollback record can name a copy that survives; a
+rollback record without an audit record can quietly undo one) — see
+`design/tooling/plan.md` D3 (audit-first) and D5 (undo-first-order)
+in the paideia-os monorepo for the linked-invariant argument.
 
 @section 9. POSIX differences
 
