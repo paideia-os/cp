@@ -114,6 +114,69 @@ dest / read / write / short write). M3 replaces these with structured
 `CopyRecord` fields via libpdx-audit that carry the exact errno as a
 first-class value.
 
+## 5b. v1.1-B addendum — sys_getcwd for O_CREAT parent-resolve (cp#21)
+
+**Wave:** R50  Milestone: v1.1-B (2026-09-12).
+
+v1.1-A shipped exactly the five trampolines above and relied on the
+kernel's `vfs_open` main `path_resolve` (R86.M1-005, paideia-os
+#1958) to anchor slash-bearing relative paths against
+`TASK_OFF_CWD` at every syscall boundary — free cwd resolution for
+`sys_stat`/`sys_open`. That covered every cp code path *except*
+the O_CREAT parent-scan.
+
+**The gap.** `src/kernel/core/fs/vfs_open.pdx` label
+`vfs_open_creat_scanned` scans the path for the last `/` to
+determine the parent-directory to create the new inode inside.
+When the create path has no `/` at all (`cp notes.md backup.md`
+from `/home/alice`), the scan falls off the front, `r9 == 0`, and
+the arm jumps straight to `vfs_open_fail`:
+
+```
+cmp r9, 0
+je  vfs_open_fail   // no '/' -> no cwd support, fail
+```
+
+So a slash-less O_CREAT destination was refused before cp's own
+error branches ever ran. See paideia-os/cp#21 for the full
+teardown.
+
+**The v1.1-B fix.** cp adds `pdxfs_getcwd` (sysno 86, R86.M1-003,
+paideia-os #1956) as a sixth trampoline and resolves the
+destination path against the task cwd in userspace BEFORE the
+O_CREAT `sys_open` call. Slash-less destinations become absolute
+paths (`/home/alice/backup.md`), the vfs_open parent-scan then
+finds a `/` at the expected position, and the create succeeds
+through the main `path_resolve` arm the read side already uses.
+Absolute destinations pass through unchanged.
+
+This lands the mkdir v1.1-B userspace-resolve precedent
+(paideia-os/mkdir#25) at the cp side too, and keeps cp forward-
+compatible with a future kernel-side fix that anchors the O_CREAT
+parent at `TASK_OFF_CWD` when no `/` is found: whichever fix the
+substrate lands, cp continues to hand it an absolute path.
+
+| Entry            | Arity | SysV → SYSCALL shuffle        | Since   |
+|------------------|-------|-------------------------------|---------|
+| `pdxfs_getcwd`   | 2 in  | none                          | v1.1-B  |
+
+Two 256-byte `.bss` slots in `Copy` back the resolve:
+
+- `copy_cwd_scratch`   — destination for `sys_getcwd`; 256 bytes
+  matches `SYS_GETCWD_PATH_MAX` in the kernel's header so any
+  path the kernel can compose fits without a `-ERANGE` round-trip.
+- `copy_dst_resolved`  — staging for the joined absolute path
+  handed to `sys_open`; 256 bytes matches `SYS_MKDIR_PATH_MAX`.
+  Overflow (`cwd_len + sep + user_len > 255`) returns
+  `-ENAMETOOLONG` (-36) as the resolve helper's rax.
+
+Table 5b: v1.1-B sysno additions.
+
+| sysno | Name          | Body handler at                                            |
+|-------|---------------|------------------------------------------------------------|
+| `77`  | `sys_stat`    | `src/kernel/core/syscall/handlers/sys_stat.pdx`  (R56.M3-002) |
+| `86`  | `sys_getcwd`  | `src/kernel/core/syscall/sys_getcwd.pdx`         (R86.M1-003) |
+
 ## 6. What M1 does NOT talk to yet
 
 - No `sys_svc_lookup` (sysno 43). cp does not need the elevate-broker

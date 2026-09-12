@@ -1,14 +1,23 @@
 # cp -- paideia-as build manifest
 #
-# Wave: R50  Milestone: v1.1-A (real body extraction)
+# Wave: R50  Milestone: v1.1-B (userspace cwd-relative dst resolution)
 #
-# v1.1-A retires the M1-001 STUB shape shipped by cp v1.0 -- the
+# v1.1-B closes paideia-os/cp#21: the kernel's vfs_open O_CREAT
+# parent-scan refuses a slash-less create outright, so
+# `cd /home/alice && cp notes.md backup.md` failed with exit 1 under
+# v1.1-A. v1.1-B adds sys_getcwd (SC+ ID 86) and resolves the
+# destination path against the task cwd in userspace BEFORE the
+# O_CREAT sys_open call site -- matching the mkdir v1.1-B precedent
+# (paideia-os/mkdir#25). Absolute destinations pass through unchanged.
+#
+# v1.1-A retired the M1-001 STUB shape shipped by cp v1.0 -- the
 # KIND_PDXFS_TXN begin/commit/abort trio, the libpdx-audit + libpdx-
 # elevate + libpdx-semantic-pipe wire-ins, the recursive walker, the
 # --over-existing undo record path, and the cap-tail signed-inode
 # preservation -- all of which were shape-in-place stubs against
-# not-yet-landed substrates. What ships in v1.1-A is a five-syscall
+# not-yet-landed substrates. What shipped in v1.1-A is a five-syscall
 # real body: sys_open + sys_read + sys_write + sys_close + sys_stat.
+# v1.1-B extends that surface to six syscalls by adding sys_getcwd.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank
 # lines and lines starting with `#` are ignored. paideia-as v0.36+
@@ -20,7 +29,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step.
 
 name        = cp
-version     = 1.1.0-A
+version     = 1.1.0-B
 kind        = tool
 entry       = Main::cp_main
 output      = build-out/cp

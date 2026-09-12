@@ -7,6 +7,117 @@ and every issue it lands, so the release-tag ↔ code-tree ↔ issue-
 graph triangulation the signing pipeline uses at `paideia-as
 release --sign` time is reproducible from this file alone.
 
+## 1.1.0-B — 2026-09-12 (userspace cwd-relative dst resolution)
+
+Closes paideia-os/cp#21 (`cp.ENH-005 cp <src> <bare-name> fails:
+O_CREAT refuses slash-less destinations`).
+
+Under v1.1-A cp passed the destination argv verbatim to `sys_open`
+with `O_WRONLY|O_CREAT|O_TRUNC`. The kernel's `vfs_open` O_CREAT
+parent-scan (`src/kernel/core/fs/vfs_open.pdx`, label
+`vfs_open_creat_scanned`) refuses a slash-less create outright, so
+`cd /home/alice && cp notes.md backup.md` printed
+`cp: cannot open destination file` and exited 1 — the most common
+`cp` invocation there is. v1.1-B closes that gap in userspace by
+resolving the destination against the task cwd BEFORE the O_CREAT
+`sys_open` call, matching the mkdir v1.1-B precedent
+(paideia-os/mkdir#25). Absolute destinations pass through unchanged.
+
+The read side is unchanged: R86.M1-005 (paideia-os #1958) rewired
+`vfs_open`'s main `path_resolve` to anchor relatives against
+`TASK_OFF_CWD`, so `cp foo/bar.txt /tmp/x` already worked under
+v1.1-A. Only the O_CREAT parent-scan lacked cwd parity — this
+release lands that parity from the userspace side.
+
+### Added
+
+- `src/pdxfs.pdx::pdxfs_getcwd(buf_va, buf_len) -> bytes_or_errno`
+  — arity-2 leaf trampoline for paideia-os sysno 86 (`sys_getcwd`,
+  R86.M1-003 #1956). Returns bytes written INCLUDING the trailing
+  NUL on success (POSIX `getcwd(3)` convention), or a negative-
+  errno u64 (`-EFAULT`/`-ERANGE`/`-ENOENT`) on failure.
+- `src/copy.pdx::copy_resolve_dst_cwd(dst_ptr) -> resolved_ptr_or_errno`
+  — leaf helper that classifies `dst_ptr[0]`. `'/'` -> return
+  `dst_ptr` unchanged; anything else (including `.`, `..`, `./x`,
+  `foo`, `a/b`) -> call `pdxfs_getcwd` into `copy_cwd_scratch`,
+  join `cwd + '/' + dst` into `copy_dst_resolved`, return the
+  resolved pointer. Separator is elided when cwd is exactly `"/"`
+  (no double slash on `cp foo bar` under root). Overflow returns
+  `-ENAMETOOLONG` (-36) when the joined length would exceed the
+  255-byte-plus-NUL scratch slot.
+- `src/copy.pdx` — two 256-byte `.bss` scratches:
+  - `copy_cwd_scratch` — destination for `sys_getcwd`; 256 bytes
+    matches `SYS_GETCWD_PATH_MAX` in the kernel's own header, so
+    any path the kernel can compose fits without a `-ERANGE`
+    round-trip.
+  - `copy_dst_resolved` — staging for the joined absolute path
+    handed to `sys_open`; 256 bytes matches `SYS_MKDIR_PATH_MAX`
+    per the mkdir v1.1-B precedent.
+- `src/copy.pdx::copy_bytes_only` — new Step 0.5 between
+  `copy_reset` and the `sys_stat(DST)` probe: call
+  `copy_resolve_dst_cwd` and update `r12` in place before every
+  subsequent step (stat, basename-join, open) sees the pointer.
+- Two new diagnostic strings on stderr:
+  - `cp: cannot read cwd for dst path` — a `sys_getcwd` -errno
+    passthrough.
+  - `cp: resolved destination path too long` — the join-length
+    overflow gate (`cwd_len + sep + user_len > 255`).
+
+### Changed
+
+- `src/pdxfs.pdx` — module header expanded to describe the sixth
+  syscall (`pdxfs_getcwd`, sysno 86). `SYSCALL_GETCWD : u64 = 86`
+  added to the sysno constant block.
+
+### Behavioural contract
+
+- `cp SRC DST` where DST starts with `'/'` (absolute) — behaviour
+  unchanged from v1.1-A.
+- `cp SRC DST` where DST starts with anything else — v1.1-B calls
+  `sys_getcwd`, joins `cwd + '/' + DST` (separator elided when
+  cwd is `"/"`), and passes the resolved absolute path to
+  `sys_open`. Downstream steps (stat, basename-join, open) see
+  the resolved pointer. `cp foo .` still copies foo into the cwd
+  directory (the stat probe finds `"/cwd/."` is a directory and
+  `copy_join_dir_basename` writes `"/cwd/./foo"` — the kernel's
+  `path_resolve` normalises the `.` component).
+- New exit sentinels:
+  - Any `sys_getcwd` -errno passthrough (`-EFAULT`=-14,
+    `-ERANGE`=-34, `-ENOENT`=-2) surfaces as the tool's exit
+    code with the `cp: cannot read cwd for dst path` diagnostic.
+    Not reachable in practice at R86 (a task's cwd is always
+    valid; a full 256-byte buffer never triggers `-ERANGE`).
+  - `-ENAMETOOLONG` (-36) surfaces with the
+    `cp: resolved destination path too long` diagnostic when
+    the joined absolute path would exceed 255 bytes.
+
+### Discipline (paideia-as v0.36+ / feedback_pdx_encoder_pitfalls)
+
+- No `test rN, rN` — every zero-check via `cmp reg, 0`.
+- No `and rN, imm64` on r8-r15 (no ANDs in the new helper at all).
+- No 2-op `imul r, imm`.
+- Every `cmp reg, imm` immediate fits `imm16` (largest is 255).
+- `-ENAMETOOLONG` (`0xFFFFFFFFFFFFFFDC`) encoded as `mov r64, imm64`
+  (movabs) into both `rax` (helper return) and `r11` (sentinel
+  compare in the caller-side error branch).
+- Byte reads: `xor rax, rax; mov_b rax, [reg + reg*1]` per the
+  #1248 mitigation pattern.
+- Reserved-label discipline: every helper label prefixed `crd_`
+  (avoids `loop`/`done`/`top`/`if` keyword collisions); caller-
+  side branches prefixed `cp_`.
+- 1-push prologue for `copy_resolve_dst_cwd` (rbx) keeps
+  `rsp % 16 == 0` at the nested `pdxfs_getcwd` call site.
+
+### Kernel-side companion (unchanged from v1.1-A)
+
+The issue body notes that the correct final resting place for the
+O_CREAT parent-scan cwd anchor is inside the kernel's `vfs_open`
+(anchor the parent at `TASK_OFF_CWD` when no `/` is found rather
+than failing). v1.1-B's userspace resolve is compatible with that
+future kernel fix: when the kernel learns to anchor, the resolved
+absolute path cp already produces continues to work unchanged, and
+the two arguments' semantics stay in lockstep.
+
 ## 1.1.0-A — 2026-09-07
 
 **Real body extraction.** Retires the M1-001 STUB shape shipped by

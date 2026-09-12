@@ -1,5 +1,23 @@
-// src/copy.pdx -- cp v1.1-A (real body extraction)
+// src/copy.pdx -- cp v1.1-B (userspace cwd-relative dst resolution)
 // CopyFile module: single-file copy body.
+//
+// v1.1-B delta (paideia-os/cp#21)
+// -------------------------------
+// v1.1-A passed the destination argv verbatim to sys_open. The kernel's
+// vfs_open O_CREAT parent-scan (src/kernel/core/fs/vfs_open.pdx, label
+// `vfs_open_creat_scanned`) refuses a slash-less create outright, so
+// `cd /home/alice && cp notes.md backup.md` failed with "cp: cannot
+// open destination file" and exit 1 -- the most common cp invocation
+// there is. v1.1-B closes that gap in userspace by resolving the
+// destination path against the task cwd (via sys_getcwd, SC+ ID 86)
+// BEFORE the O_CREAT sys_open call, matching the mkdir v1.1-B
+// precedent (paideia-os/mkdir#25). Absolute destinations pass through
+// unchanged; slash-less and dot-prefixed destinations are joined as
+// `cwd + '/' + dst` into a 256-byte .bss scratch and the resolved
+// pointer replaces r12 for every subsequent step (stat, directory
+// basename join, open, error diagnostic). The read side already
+// resolves via TASK_OFF_CWD per R86.M1-005 (paideia-os #1958) and
+// needs no cp-side touch.
 //
 // Scope (v1.1-A)
 // --------------
@@ -106,24 +124,35 @@
 //
 // Cross-module externs consumed
 // -----------------------------
-//   Pdxfs::pdxfs_open  (path, flags, mode) -- 3-arg since v1.1-A
-//   Pdxfs::pdxfs_read  (fd, buf, len)
-//   Pdxfs::pdxfs_write (fd, buf, len)
-//   Pdxfs::pdxfs_close (fd)
-//   Pdxfs::pdxfs_stat  (path, statbuf)
-//   Print::print_err   (buf, len)
+//   Pdxfs::pdxfs_open   (path, flags, mode) -- 3-arg since v1.1-A
+//   Pdxfs::pdxfs_read   (fd, buf, len)
+//   Pdxfs::pdxfs_write  (fd, buf, len)
+//   Pdxfs::pdxfs_close  (fd)
+//   Pdxfs::pdxfs_stat   (path, statbuf)
+//   Pdxfs::pdxfs_getcwd (buf, buf_len)      -- new at v1.1-B
+//   Print::print_err    (buf, len)
 
 module Copy = structure {
 
   // -- Buffer + counter storage ----------------------------------------
-  pub let COPY_BUF_LEN      : u64 = 4096
-  pub let COPY_DST_PATH_LEN : u64 = 512
-  pub let COPY_STAT_LEN     : u64 = 64
+  pub let COPY_BUF_LEN          : u64 = 4096
+  pub let COPY_DST_PATH_LEN     : u64 = 512
+  pub let COPY_STAT_LEN         : u64 = 64
+  // v1.1-B cwd-resolution scratches. 256 bytes each matches the
+  // kernel's SYS_GETCWD_PATH_MAX (sys_getcwd.pdx) so any path the
+  // kernel can compose fits without a -ERANGE round-trip. The
+  // resolved-scratch also caps at 256 so cwd_len + '/' + user_len
+  // must fit with room for the trailing NUL at index 255; overflow
+  // returns -ENAMETOOLONG through the resolve helper's rax.
+  pub let COPY_CWD_SCRATCH_LEN  : u64 = 256
+  pub let COPY_DST_RESOLVED_LEN : u64 = 256
 
-  pub let mut copy_buf      : [u8; 4096] = uninit @align(8)
-  pub let mut copy_dst_path : [u8; 512]  = uninit @align(8)
-  pub let mut copy_src_stat : [u8; 64]   = uninit @align(8)
-  pub let mut copy_dst_stat : [u8; 64]   = uninit @align(8)
+  pub let mut copy_buf          : [u8; 4096] = uninit @align(8)
+  pub let mut copy_dst_path     : [u8; 512]  = uninit @align(8)
+  pub let mut copy_src_stat     : [u8; 64]   = uninit @align(8)
+  pub let mut copy_dst_stat     : [u8; 64]   = uninit @align(8)
+  pub let mut copy_cwd_scratch  : [u8; 256]  = uninit @align(8)
+  pub let mut copy_dst_resolved : [u8; 256]  = uninit @align(8)
 
   pub let mut fd_src        : u64 = uninit @align(8)
   pub let mut fd_dst        : u64 = uninit @align(8)
@@ -167,6 +196,15 @@ module Copy = structure {
   pub let DST_PATH_TOO_LONG_MSG : [u8; 43] =
     "cp: destination path too long (dir + name)\n"
   pub let DST_PATH_TOO_LONG_MSG_LEN : u64 = 43
+
+  // v1.1-B: sys_getcwd trampoline diagnostics.
+  pub let GETCWD_FAIL_MSG : [u8; 33] =
+    "cp: cannot read cwd for dst path\n"
+  pub let GETCWD_FAIL_MSG_LEN : u64 = 33
+
+  pub let RESOLVED_DST_TOO_LONG_MSG : [u8; 39] =
+    "cp: resolved destination path too long\n"
+  pub let RESOLVED_DST_TOO_LONG_MSG_LEN : u64 = 39
 
   // ============================================================================
   // copy_reset()
@@ -316,6 +354,185 @@ module Copy = structure {
     }
 
   // ============================================================================
+  // copy_resolve_dst_cwd(dst_ptr) -> resolved_ptr_or_errno
+  //
+  // Signature: copy_resolve_dst_cwd : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): dst_ptr -- VA of a NUL-terminated destination path
+  // RAX (output): on success, the VA of a NUL-terminated absolute
+  //               destination path (either dst_ptr unchanged for an
+  //               absolute input, or &copy_dst_resolved for a relative
+  //               input that has been joined with the task cwd);
+  //               on failure, a negative-errno u64 (bit 63 set) --
+  //               -EFAULT/-ERANGE/-ENOENT passthrough from sys_getcwd,
+  //               or -ENAMETOOLONG (-36) when the joined length would
+  //               overflow the 255-byte-plus-NUL scratch slot.
+  //
+  // v1.1-B fix for paideia-os/cp#21. The kernel's vfs_open O_CREAT
+  // parent-scan (src/kernel/core/fs/vfs_open.pdx, label
+  // `vfs_open_creat_scanned`) refuses a slash-less create outright,
+  // so `cd /home/alice && cp notes.md backup.md` fails at the
+  // sys_open call site before cp's error branches ever fire.
+  // Landing the resolve here means the string handed to sys_open IS
+  // the absolute path that lands on disk -- the mkdir v1.1-B
+  // precedent (paideia-os/mkdir#25) is the shape reference.
+  //
+  // Classification of dst_ptr's first byte:
+  //   '/'    -- absolute; return dst_ptr unchanged (path_resolve
+  //             anchors absolute paths against the mount root
+  //             regardless of cwd, so any prefixing would be wrong).
+  //   other  -- relative (includes '.', '..', './x', 'foo', 'a/b');
+  //             call sys_getcwd, join `cwd + '/' + dst_ptr` into
+  //             copy_dst_resolved, return &copy_dst_resolved. cp
+  //             deliberately does NOT refuse "." the way mkdir v1.1-B
+  //             refuses it, because `cp foo .` is valid (copy foo
+  //             into the cwd directory) and the DST-is-a-directory
+  //             stat probe downstream handles the basename join.
+  //
+  // Separator elision: when cwd is exactly "/" the '/' between cwd
+  // and dst is omitted (no double slash on `cp foo bar` when cwd is
+  // the root), matching mkdir v1.1-B `_mkdir_cwd_scratch[0]=='/'`
+  // behaviour.
+  //
+  // Register plan (1-push prologue -> rsp%16 == 0 for the nested
+  // pdxfs_getcwd call):
+  //   rbx = dst_ptr          (saved across pdxfs_getcwd; callee-save)
+  //   rax = call return / temp
+  //   rcx = cwd_len (excluding NUL)
+  //   rdx = user_len (bounded strlen(dst_ptr))
+  //   r8  = separator length (0 or 1)
+  //   r9  = write cursor during copy
+  //   r11 = lea scratch for .bss bases
+  //
+  // Leaf w.r.t. the copy-body-caller side (only calls pdxfs_getcwd,
+  // which is itself a leaf trampoline).
+  // ============================================================================
+  pub let copy_resolve_dst_cwd : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (dst_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.1-B copy_resolve_dst_cwd (paideia-os/cp#21 fix). Resolves a slash-less or dot-prefixed destination path against the task cwd BEFORE the O_CREAT sys_open call, so vfs_open_creat_scanned's 'no slash -> fail' arm never fires from cp. Classify dst[0]: '/' -> return rdi unchanged (absolute paths anchor at mount root regardless of cwd). Otherwise call pdxfs_getcwd (SC+ ID 86, R86.M1-003 #1956) into copy_cwd_scratch with buf_len=256. rax<0 -> return -errno verbatim (caller emits GETCWD_FAIL_MSG). rax>0 -> rax = bytes incl NUL, cwd_len = rax-1. Inline bounded strlen(dst_ptr), cap at 255; overflow -> return -ENAMETOOLONG (-36). Compute sep = (cwd == \"/\") ? 0 : 1 by checking copy_cwd_scratch[0] when cwd_len==1. total = cwd_len + sep + user_len; > 255 -> return -ENAMETOOLONG. Copy cwd bytes, sep byte if needed, user bytes, NUL-terminate; return &copy_dst_resolved. Register plan: rbx = dst_ptr (callee-save, saved across pdxfs_getcwd); rcx = cwd_len; rdx = user_len; r8 = sep; r9 = write cursor; r11 = lea scratch. 1-push prologue keeps rsp%16 == 0 for the nested pdxfs_getcwd call site. Encoder-gap discipline (feedback_pdx_encoder_pitfalls): no test mnemonic (every zero-check `cmp reg, 0`), no `and rN, imm64` on r8-r15 (no ANDs at all here), no 2-op imul, every cmp imm fits imm16 (max 255 and 0x2F). Byte reads via `xor rax, rax; mov_b rax, [reg + reg*1]`. -ENAMETOOLONG encoded as full u64 0xFFFFFFFFFFFFFFDC via movabs (mov r64, imm64). Reserved-label discipline: every internal label prefixed `crd_` to dodge paideia-as reserved keywords (`loop`, `done`, `top`, `if`).",
+      block: {
+        // ---- Prologue -------------------------------------------------------
+        push rbx;                              // rsp%16: 8 -> 0
+        mov rbx, rdi;                          // rbx = dst_ptr
+
+        // ---- Classify first byte -------------------------------------------
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x2F;                         // '/'
+        je crd_absolute;
+
+        // ---- sys_getcwd(&copy_cwd_scratch, 256) ----------------------------
+        lea rdi, [rip + copy_cwd_scratch];
+        mov rsi, 256;                          // COPY_CWD_SCRATCH_LEN
+        call pdxfs_getcwd;
+        cmp rax, 0;
+        jl crd_errno_passthrough;
+
+        mov rcx, rax;                          // rcx = bytes incl NUL
+        sub rcx, 1;                            // rcx = cwd_len
+
+        // ---- Bounded strlen(dst_ptr), cap at 255 ---------------------------
+        xor rdx, rdx;                          // rdx = user_len
+      crd_ulen_top:
+        cmp rdx, 255;
+        jae crd_too_long;
+        xor rax, rax;
+        mov_b rax, [rbx + rdx*1];
+        cmp rax, 0;
+        je crd_ulen_done;
+        add rdx, 1;
+        jmp crd_ulen_top;
+
+      crd_ulen_done:
+        // ---- Compute separator length --------------------------------------
+        // Default sep = 1. If cwd is exactly "/" (cwd_len == 1 AND
+        // copy_cwd_scratch[0] == '/'), sep = 0 -- avoids `//foo`
+        // when the caller cwd is the root.
+        mov r8, 1;                             // default sep = 1
+        cmp rcx, 1;
+        jne crd_sep_done;
+        lea r11, [rip + copy_cwd_scratch];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0x2F;
+        jne crd_sep_done;
+        xor r8, r8;                            // cwd == "/" -> sep = 0
+
+      crd_sep_done:
+        // ---- Length check: cwd_len + sep + user_len must fit in 255 --------
+        mov r9, rcx;
+        add r9, r8;
+        add r9, rdx;
+        cmp r9, 255;
+        ja crd_too_long;
+
+        // ---- Copy cwd bytes into copy_dst_resolved[0..cwd_len) -------------
+        xor r9, r9;                            // r9 = write cursor
+      crd_cpy_cwd_top:
+        cmp r9, rcx;
+        jae crd_cpy_cwd_done;
+        lea r11, [rip + copy_cwd_scratch];
+        xor rax, rax;
+        mov_b rax, [r11 + r9*1];
+        lea r11, [rip + copy_dst_resolved];
+        mov_b [r11 + r9*1], rax;
+        add r9, 1;
+        jmp crd_cpy_cwd_top;
+
+      crd_cpy_cwd_done:
+        // ---- Emit separator '/' if needed ----------------------------------
+        cmp r8, 0;
+        je crd_cpy_user_start;
+        mov rax, 0x2F;
+        lea r11, [rip + copy_dst_resolved];
+        mov_b [r11 + r9*1], rax;
+        add r9, 1;
+
+      crd_cpy_user_start:
+        // ---- Copy user bytes -----------------------------------------------
+        xor r8, r8;                            // r8 = user read index
+      crd_cpy_user_top:
+        cmp r8, rdx;
+        jae crd_cpy_user_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r8*1];
+        lea r11, [rip + copy_dst_resolved];
+        mov_b [r11 + r9*1], rax;
+        add r9, 1;
+        add r8, 1;
+        jmp crd_cpy_user_top;
+
+      crd_cpy_user_done:
+        // ---- NUL-terminate at [copy_dst_resolved + r9] ---------------------
+        xor rax, rax;
+        lea r11, [rip + copy_dst_resolved];
+        mov_b [r11 + r9*1], rax;
+
+        // ---- Return &copy_dst_resolved -------------------------------------
+        lea rax, [rip + copy_dst_resolved];
+        jmp crd_epilogue;
+
+      crd_absolute:
+        // Absolute path -- return dst_ptr unchanged.
+        mov rax, rbx;
+        jmp crd_epilogue;
+
+      crd_too_long:
+        // Overflow -> -ENAMETOOLONG. Encoded as full u64 via movabs.
+        mov rax, 0xFFFFFFFFFFFFFFDC;           // -36 == -ENAMETOOLONG
+        jmp crd_epilogue;
+
+      crd_errno_passthrough:
+        // rax already holds the negative errno from pdxfs_getcwd.
+        jmp crd_epilogue;
+
+      crd_epilogue:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
   // copy_bytes_only(src_ptr, dst_ptr) -> exit_code
   //
   // Signature: copy_bytes_only : (u64, u64) -> u64 !{mem, sysreg} @{}
@@ -344,6 +561,19 @@ module Copy = structure {
 
         // ---- Step 0: reset state --------------------------------------------
         call copy_reset;
+
+        // ---- Step 0.5: resolve DST against cwd if it has no leading '/' -----
+        // v1.1-B (paideia-os/cp#21). vfs_open's O_CREAT parent-scan
+        // refuses slash-less paths outright, so we join `cwd + '/' +
+        // dst` into copy_dst_resolved BEFORE the stat probe and the
+        // subsequent O_CREAT sys_open. Absolute paths pass through
+        // unchanged. Every downstream step (stat, basename-join,
+        // open) sees the resolved pointer.
+        mov rdi, r12;                          // dst path
+        call copy_resolve_dst_cwd;
+        cmp rax, 0;
+        jl cp_resolve_dst_fail;
+        mov r12, rax;                          // r12 = resolved dst path
 
         // ---- Step 1: stat DST -- is it a directory? -------------------------
         // stat failure (ENOENT, ENOTDIR, ...) is not an error at this
@@ -479,6 +709,35 @@ module Copy = structure {
         mov rbx, 0xFFFFFFFFFFFFFFDC;           // -36 == -ENAMETOOLONG
         lea rdi, [rip + DST_PATH_TOO_LONG_MSG];
         mov rsi, 43;
+        call print_err;
+        mov rax, rbx;
+        jmp cp_epilogue;
+
+      cp_resolve_dst_fail:
+        // v1.1-B (paideia-os/cp#21). copy_resolve_dst_cwd returned a
+        // negative-errno u64 either from sys_getcwd (-EFAULT/-ERANGE/
+        // -ENOENT) or from the join-length overflow gate
+        // (-ENAMETOOLONG). No fds are open yet. Distinguish the two
+        // classes by the sentinel value so the diagnostic names the
+        // right cause. -36 == 0xFFFFFFFFFFFFFFDC is the ENAMETOOLONG
+        // sentinel produced by the resolve helper; any other negative
+        // value is a getcwd passthrough. Stage the sentinel through
+        // rax (movabs precedent already used at cp_dst_path_too_long
+        // and cp_short_write) rather than a high-reg -- keeps the
+        // encoder gap-free.
+        mov rbx, rax;                          // save -errno to callee-save
+        mov rax, 0xFFFFFFFFFFFFFFDC;           // -ENAMETOOLONG (movabs)
+        cmp rbx, rax;
+        jne cp_resolve_dst_getcwd_fail;
+        lea rdi, [rip + RESOLVED_DST_TOO_LONG_MSG];
+        mov rsi, 39;
+        call print_err;
+        mov rax, rbx;
+        jmp cp_epilogue;
+
+      cp_resolve_dst_getcwd_fail:
+        lea rdi, [rip + GETCWD_FAIL_MSG];
+        mov rsi, 33;
         call print_err;
         mov rax, rbx;
         jmp cp_epilogue;

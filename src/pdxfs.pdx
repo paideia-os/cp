@@ -1,24 +1,29 @@
-// src/pdxfs.pdx -- cp v1.1-A (real-body-only trampolines)
-// Pdxfs module: real-syscall trampolines for open/read/write/close/stat.
+// src/pdxfs.pdx -- cp v1.1-B (real-body trampolines + sys_getcwd)
+// Pdxfs module: real-syscall trampolines for open/read/write/close/stat
+// plus the sys_getcwd trampoline that v1.1-B uses for userspace
+// resolution of the destination path against the task cwd.
 //
-// Scope (v1.1-A)
+// Scope (v1.1-B)
 // --------------
-// v1.0's pdxfs.pdx held nine trampolines: the five REAL ones below
-// plus KIND_PDXFS_TXN begin/commit/abort stubs (returned 0
-// unconditionally pending an R42 substrate landing that never
-// arrived) and readdir/mkdir trampolines that only the -r walker
-// used. v1.1-A retires the M1-001 STUB shape wholesale: no txn
-// wrapping (dispatch is TXN-free), no walker (no -r flag at v1.1-A),
-// so those four bodies + the two directory helpers are gone.
+// v1.1-A shipped five real syscall trampolines (open/read/write/close/
+// stat) with no cwd resolution -- cp's caller-visible destination
+// argv was passed to sys_open verbatim, and the kernel's `vfs_open`
+// (R86.M1-005) anchored a slash-bearing relative destination against
+// the caller's TASK_OFF_CWD for free. cp v1.1-B adds sys_getcwd so
+// the copy body can resolve a slash-less destination in userspace
+// BEFORE the O_CREAT sys_open call site -- see the paideia-os/cp#21
+// discussion for the failure mode (`vfs_open_creat_scanned` refuses
+// slash-less O_CREAT paths outright).
 //
-// This leaves exactly the five kernel syscalls cp needs for a
-// simple file-to-file copy:
+// This leaves six kernel syscalls cp uses for a simple file-to-file
+// copy:
 //
-//   pdxfs_open  (path, flags, mode) -> fd or -errno        [sysno 2]
-//   pdxfs_read  (fd, buf, len)      -> n or -errno         [sysno 0]
-//   pdxfs_write (fd, buf, len)      -> n or -errno         [sysno 1]
-//   pdxfs_close (fd)                -> 0 or -errno         [sysno 3]
-//   pdxfs_stat  (path, statbuf)     -> 0 or -errno         [sysno 77]
+//   pdxfs_open   (path, flags, mode) -> fd or -errno        [sysno 2]
+//   pdxfs_read   (fd, buf, len)      -> n or -errno         [sysno 0]
+//   pdxfs_write  (fd, buf, len)      -> n or -errno         [sysno 1]
+//   pdxfs_close  (fd)                -> 0 or -errno         [sysno 3]
+//   pdxfs_stat   (path, statbuf)     -> 0 or -errno         [sysno 77]
+//   pdxfs_getcwd (buf, buf_len)      -> bytes or -errno     [sysno 86]
 //
 // v1.1-A widens pdxfs_open's ring-3 surface from (path, flags) to
 // (path, flags, mode) so the caller can preserve the source's POSIX
@@ -65,11 +70,12 @@
 module Pdxfs = structure {
 
   // -- Syscall ids (mirror paideia-os src/kernel/core/syscall/dispatch.pdx) --
-  pub let SYSCALL_READ  : u64 = 0
-  pub let SYSCALL_WRITE : u64 = 1
-  pub let SYSCALL_OPEN  : u64 = 2
-  pub let SYSCALL_CLOSE : u64 = 3
-  pub let SYSCALL_STAT  : u64 = 77
+  pub let SYSCALL_READ   : u64 = 0
+  pub let SYSCALL_WRITE  : u64 = 1
+  pub let SYSCALL_OPEN   : u64 = 2
+  pub let SYSCALL_CLOSE  : u64 = 3
+  pub let SYSCALL_STAT   : u64 = 77
+  pub let SYSCALL_GETCWD : u64 = 86    // R86.M1-003 (paideia-os #1956)
 
   // -- Open flag constants (mirror src/kernel/core/fs/vfs_open.pdx) --
   pub let O_RDONLY : u64 = 0
@@ -206,6 +212,40 @@ module Pdxfs = structure {
         mov rdx, rsi;                          // statbuf_ptr (grab first)
         mov rsi, 255;                          // path_len cap (walker hint)
         mov rax, 77;                           // SYSCALL_STAT
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_getcwd(buf_va, buf_len) -> bytes_or_errno
+  //
+  // Signature: pdxfs_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): buf_va  -- VA of a caller-owned scratch buffer
+  // RSI (input): buf_len -- capacity of the buffer in bytes
+  // RAX (output): bytes written INCLUDING the trailing NUL on success
+  //               (POSIX getcwd(3) convention: rax-1 is the strlen),
+  //               or a negative-errno u64 on failure (-EFAULT = -14,
+  //               -ERANGE = -34, -ENOENT = -2).
+  //
+  // v1.1-B adds this trampoline so copy_bytes_only can resolve a
+  // slash-less destination path against the task's cwd BEFORE the
+  // O_CREAT sys_open call site. The kernel's vfs_open O_CREAT
+  // parent-scan (src/kernel/core/fs/vfs_open.pdx, label
+  // `vfs_open_creat_scanned`) refuses a path with no '/' outright --
+  // paideia-os/cp#21. Landing the resolve in userspace matches the
+  // mkdir v1.1-B precedent (paideia-os/mkdir#25) and is forward-
+  // compatible with a future backend adapter that does not honour
+  // TASK_OFF_CWD.
+  //
+  // Arity 2; no r10 shuffle. Leaf.
+  // ============================================================================
+  pub let pdxfs_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (buf_va: u64) (buf_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.1-B pdxfs_getcwd. Trampoline for paideia-os sysno 86 (sys_getcwd) landed by R86.M1-003 (#1956) at src/kernel/core/syscall/sys_getcwd.pdx. SysV arg1=rdi(buf_va), arg2=rsi(buf_len) map straight onto SYSCALL arg registers (arity 2 < 4, no r10 shuffle). Return value verbatim from the syscall: bytes written INCLUDING the trailing NUL on success (POSIX getcwd(3) convention; rax-1 is the strlen), or negative-errno u64 on failure (-EFAULT=-14 for a bad buf_va, -ERANGE=-34 for buf_len < required, -ENOENT=-2 for an unlinked cwd entry). Consumed by Copy::copy_resolve_dst_cwd for the O_CREAT parent-resolve gap (paideia-os/cp#21) -- the mkdir v1.1-B userspace-resolve precedent (paideia-os/mkdir#25) is the shape reference. Leaf; sysreg effect for the SYSCALL clobber (rcx, r11).",
+      block: {
+        mov rax, 86;                           // SYSCALL_GETCWD
         syscall;
         ret
       }
