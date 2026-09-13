@@ -29,9 +29,9 @@
 # await the crypto intrinsic.
 
 package        = cp
-version        = 1.0.0
-release_date   = 2026-08-22
-paideia_as_min = 0.33
+version        = 1.2.0
+release_date   = 2026-09-13
+paideia_as_min = 0.36
 kind           = tool
 
 # --- Release payload -------------------------------------------------

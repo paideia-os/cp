@@ -1,0 +1,172 @@
+// src/pipe.pdx -- cp v1.2.0 (Closes paideia-os/cp#33)
+// Pipe module: CopyRecord@0.1 emission via sys_semantic_send (sysno 115).
+//
+// Scope (v1.2.0)
+// --------------
+// cp v1.1 shipped no semantic-pipe emit -- the v1.0 M1-001 STUB shape's
+// libpdx-semantic-pipe wire-in retired with beecb0c and successive
+// v1.1 landings emitted nothing on stdout on success. R107-M0-001
+// (paideia-os #2350) landed the kernel-side sys_semantic_send producer
+// substrate at sysno 115 with a 240-byte record cap and a 16-slot
+// single-global ring; v1.2.0 wires cp onto it so every completed copy
+// emits one CopyRecord@0.1 to the ring for downstream consumers
+// (shell pipelines, session recorders, semantic-pipe subscribers).
+//
+// Contract (sys_semantic_send, verbatim from src/kernel/core/syscall/
+// handlers/sys_semantic_send.pdx):
+//   rdi = schema      opaque u64 schema tag (echoed to the consumer;
+//                     kernel does not interpret)
+//   rsi = record_ptr  user VA of the record bytes
+//   rdx = record_len  bytes in [1, 240]
+//   rax = 0 on success, or negative-errno u64 on failure
+//         (-EFAULT for bad record_ptr, -EINVAL for out-of-range len).
+//
+// Return-value handling
+// ---------------------
+// The syscall's return is intentionally discarded at the call site
+// (see copy.pdx cp_eof). Both failure classes are marshalling bugs
+// in THIS file (a wrong len constant or a broken lea for a static
+// .bss record buffer), not per-run conditions the caller can act on.
+// The pdxsock v1.1-B precedent (tools/user/pdxsock/src/main.pdx line
+// 1929) is the shape reference.
+//
+// Record layout (CopyRecord@0.1, 24 bytes @align(8))
+// --------------------------------------------------
+//   [ +0] bytes_copied  u64   -- total bytes drained through the
+//                                copy loop (from copy_bytes_only's
+//                                .bss `bytes_copied` accumulator).
+//   [ +8] src_mode      u64   -- POSIX mode word from the source
+//                                stat (u32 zero-extended). 0 when the
+//                                stat backend fills mode=0 (tmpfs
+//                                today), matching the copy-side
+//                                default-mode fallback shape.
+//   [+16] tsc_ticks     u64   -- rdtsc snapshot at emit time. Raw TSC
+//                                ticks until sys_clock_now lands
+//                                (paideia-as-side clock plumbing);
+//                                schema-shape stable across the
+//                                ticks->ns rename per the pdxsock
+//                                precedent (src/main.pdx §Record
+//                                shape).
+//
+// The 24-byte record fits well below the sysno-115 240-byte cap and
+// leaves ample headroom for v1.3+ extension (dst_mode, uid/gid,
+// duration_ns delta once sys_clock_now lands) without a schema-tag
+// rename. Consumer decoders match on the leading schema tag
+// (COPY_RECORD_SCHEMA below) plus record_len from the ring's slot
+// header to detect layout version drift.
+//
+// Schema tag
+// ----------
+// A stable opaque u64 identifying CopyRecord@0.1 to downstream
+// consumers. Formed by packing the ASCII bytes "CopyRec\x01" into a
+// little-endian u64:
+//     byte 0 = 0x01  (version marker)
+//     bytes 1-7 = "ceRypoC"  (ASCII "CopyRec" reversed for LE)
+// -> u64 literal 0x436F707952656301
+// The version byte in the low position lets a future v0.2 schema
+// bump the leading byte without displacing the family identifier.
+//
+// paideia-as compliance (v0.36+)
+// ------------------------------
+//   - Module Pipe (PascalCase basename matches src/pipe.pdx).
+//   - No test mnemonic; no zero-checks needed in this leaf.
+//   - r11 is scratch (used for every lea against the record buffer).
+//   - Every `mov r64, imm` <= 0x7FFFFFFF EXCEPT the schema tag which
+//     is a movabs (`mov r64, imm64`; paideia-as auto-selects the
+//     REX+imm64 encoding for immediates > 0x7FFFFFFF).
+//   - Byte loads unused here (records are all u64 field writes).
+//   - rdtsc pattern per src/kernel/core/fs/pdxfs_lite/uuid.pdx: after
+//     rdtsc, rax = low 32, rdx = high 32; shl rdx, 32; or rax, rdx
+//     reconstructs the full 64-bit tick counter.
+//   - Reserved-label discipline: no branch labels in this file, so
+//     no prefix required. If a future revision adds branches, use
+//     `pipe_` prefix to dodge `loop`/`done`/`top` keyword clashes.
+
+module Pipe = structure {
+
+  // -- Syscall id ------------------------------------------------------
+  // R107-M0-001 (paideia-os #2350). Mirrors dispatch.pdx L824.
+  pub let SYSCALL_SEMANTIC_SEND : u64 = 115
+
+  // -- Record shape constants -----------------------------------------
+  // Record length (24 bytes) is well below the sysno-115 cap (240) and
+  // fits three u64 fields aligned. len must not be 0 and must not
+  // exceed 240 or the syscall returns -EINVAL.
+  pub let COPY_RECORD_LEN : u64 = 24
+
+  // -- Schema tag ------------------------------------------------------
+  // See module header for the derivation. Stable across every
+  // CopyRecord@0.1 emit; a schema-shape bump (v0.2, e.g. adding
+  // dst_mode + uid/gid) increments only the low byte (0x02) so
+  // consumers can filter on the high 56 bits alone.
+  pub let COPY_RECORD_SCHEMA : u64 = 0x436F707952656301
+
+  // -- Record scratch buffer (.bss, single global) --------------------
+  // sys_semantic_send copies the record bytes into the kernel's ring
+  // synchronously, so the caller can reuse this buffer on the next
+  // emit without a barrier. @align(8) matches the ring-slot alignment
+  // in the kernel and avoids a userspace-side unaligned-store penalty
+  // on the three field writes.
+  pub let mut pipe_record_buf : [u8; 24] = uninit @align(8)
+
+  // ============================================================================
+  // pipe_emit_copy_record(bytes_copied, src_mode) -> discarded
+  //
+  // Signature: pipe_emit_copy_record : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): bytes_copied -- total bytes drained through the copy
+  //                              loop (from copy_bytes_only's .bss
+  //                              accumulator).
+  // RSI (input): src_mode     -- POSIX mode word extracted from the
+  //                              source stat (u32 zero-extended). 0
+  //                              when the stat backend fills mode=0.
+  // RAX (output): the syscall's return value verbatim (caller
+  //               discards; see module header).
+  //
+  // Marshal the 24-byte CopyRecord@0.1 into `pipe_record_buf`, then
+  // invoke sys_semantic_send. Leaf; no callee-save touched, no
+  // push/pop parity to preserve. rdtsc is a leaf-legal read of the
+  // hardware TSC (no ring transition, no locks, no serializing
+  // barrier under RDTSC vs RDTSCP -- an unserialised TSC is acceptable
+  // here because the emit is best-effort observability, not a
+  // sequencer).
+  //
+  // Register plan (leaf; syscall + rdtsc are the only nested ops):
+  //   rax = rdtsc low half / syscall id / return
+  //   rcx = SYSCALL-clobbered per amd64 fast-syscall convention
+  //   rdx = rdtsc high half / syscall arg 3 (record_len)
+  //   rdi = record schema (rewritten after buf marshal)
+  //   rsi = record_ptr (rewritten after buf marshal)
+  //   r11 = SYSCALL-clobbered + lea scratch for pipe_record_buf base
+  // ============================================================================
+  pub let pipe_emit_copy_record : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (bytes_copied: u64) (src_mode: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.2.0 pipe_emit_copy_record (Closes paideia-os/cp#33). Emits one CopyRecord@0.1 to the kernel-side sys_semantic_send producer ring (sysno 115, R107-M0-001 #2350) at the successful-exit tail of copy_bytes_only. Marshal shape: 24-byte record with bytes_copied@+0, src_mode@+8, tsc_ticks@+16 -- fits well below the ring's 240-byte per-slot cap and leaves headroom for a v0.2 extension (dst_mode + uid/gid + sys_clock_now-sourced duration_ns) without a schema-tag rename. Schema tag COPY_RECORD_SCHEMA=0x436F707952656301 (packs ASCII 'CopyRec\\x01' little-endian; low byte carries the version marker so a v0.2 bump increments only the low 8 bits and consumers can filter on the high 56 bits alone). Register discipline: marshal bytes_copied (rdi) + src_mode (rsi) into the buffer FIRST before rdtsc/syscall clobber rax/rcx/rdx/r11; then rdtsc (rax=low, rdx=high) + `shl rdx, 32; or rax, rdx` reconstructs the 64-bit tick counter (proven at src/kernel/core/fs/pdxfs_lite/uuid.pdx); store into [buf+16]; then set up the syscall args (rdi=schema via movabs, rsi=&pipe_record_buf via lea, rdx=24, rax=115) and syscall. Return value verbatim from the syscall (the caller discards). Leaf: no callee-save touched, no push/pop parity to preserve, no cross-module calls. sysreg effect for the SYSCALL clobber (rcx, r11). Encoder discipline (feedback_pdx_encoder_pitfalls): no test rN,rN (no zero-checks in this file at all); no `and rN, imm64` on r8-r15 (no ANDs); no 2-op imul; no wide cmp imm (no cmps at all); schema tag > 0x7FFFFFFF uses `mov r64, imm64` movabs (paideia-as auto-encodes REX+imm64 when the immediate needs it). No branch labels -> no reserved-label prefix required. rsp%16 discipline: this is a leaf with no CALLs and no PUSH/POP, so the caller's rsp alignment survives to the SYSCALL unchanged (syscall does not care about the SysV 16-byte alignment; it uses the SYSCALL instruction which is stack-invariant).",
+      block: {
+        // ---- Marshal bytes_copied and src_mode into buffer BEFORE
+        //      any rdtsc/syscall clobbers the caller-arg regs -------
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 0], rdi;                    // bytes_copied
+        mov [r11 + 8], rsi;                    // src_mode
+
+        // ---- rdtsc -> full 64-bit tick counter in rax -------------
+        // rdtsc writes low 32b to rax and high 32b to rdx; the
+        // 64-bit value is (rdx << 32) | rax after the shift/or pair.
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        lea r11, [rip + pipe_record_buf];
+        mov [r11 + 16], rax;                   // tsc_ticks
+
+        // ---- sys_semantic_send(schema, buf, 24). sysno 115. -------
+        mov rdi, 0x436F707952656301;           // COPY_RECORD_SCHEMA (movabs)
+        lea rsi, [rip + pipe_record_buf];
+        mov rdx, 24;                           // COPY_RECORD_LEN
+        mov rax, 115;                          // SYSCALL_SEMANTIC_SEND
+        syscall;
+
+        // Return value verbatim; the caller discards it.
+        ret
+      }
+    }
+}

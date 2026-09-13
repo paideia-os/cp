@@ -1,25 +1,82 @@
 # cp -- caps.decl
 #
 # Wave: R50
-# Milestone: v1.1-A (real body extraction)
+# Milestone: v1.2.0 (KIND_PDXFS_VOL declaration + semantic-pipe emit)
 #
-# cp copies a source file to a destination via five kernel syscalls:
-# sys_open, sys_read, sys_write, sys_close, sys_stat. Its v1.1-A
-# caps.decl declares the MINIMUM cap set every invocation receives
-# from the loader's InitCap sidecar.
+# cp copies a source file to a destination via six kernel syscalls
+# today (v1.1-B): sys_open, sys_read, sys_write, sys_close, sys_stat,
+# sys_getcwd. v1.2.0 adds one more (sys_semantic_send, sysno 115) for
+# CopyRecord@0.1 emission, and pre-declares KIND_PDXFS_VOL against the
+# R90 kernel substrate (sysnos 70 / 104 / 105 / 107 for
+# sys_pdxfs_txn_open / _commit / _abort / _undo_write) that
+# paideia-os/cp#35 (`cp.ENH-011`) will wire the outer TXN back onto.
 #
-# v1.1-A retires the v1.0 M1-001 STUB cap surface:
+# The v1.2.0 caps.decl surface is thus:
 #
-#   KIND_IPC_ENDPOINT (invoke)              -- pipe substrate; retired
-#                                              with libpdx-semantic-pipe.
-#   KIND_PDXFS_TXN (invoke)                 -- retired with the outer
-#                                              txn wrap.
+#   KIND_USER          (self)                  -- identity root
+#   KIND_PDXFS_FILE    (read, <src>)           -- source read
+#   KIND_PDXFS_FILE    (write, <dst-parent>)   -- destination write
+#   KIND_PDXFS_VOL     (invoke, <mount>)       -- outer-TXN volume ref
+#                                                 (declared; adoption
+#                                                  arm defers to cp#35)
+#
+# The KIND_PDXFS_VOL row is a DECLARATION and an ADOPTION NOTE rather
+# than an active gate at v1.2.0. Grounds:
+#
+#   (1) R90-XREPO.013.M3-003 (paideia-os/cp#31) is the caps-manifest
+#       half of the R90 TXN adoption plan (design/round-retrospectives/
+#       r90-xrepo-wave3-plan.md §5). Adding the KIND_PDXFS_VOL row now
+#       (rather than at cp#35 landing) means the manifest reconciler
+#       will not fail-fast with CAP_MANIFEST_MISSING when cp#35's
+#       body edit adds the first pdxfs_txn_open call site -- the cap
+#       is already declared; only the invoke happens later. The
+#       inverse ordering (add-cap-when-first-called) would take two
+#       coordinated releases across the InitCap sidecar packaging
+#       pipeline and the loader-side reconciler.
+#
+#   (2) The R90 substrate has landed in-kernel (see paideia-os
+#       commits 2111 / 2112 / 2113 for sysnos 104 / 105 / 107) but
+#       the userspace side (a KIND_PDXFS_VOL slot in cp's InitCap
+#       sidecar, plus the loader-side match against this file) is
+#       what R90-XREPO.013.M3-003 gates. Landing the declaration
+#       here without the invoke keeps that gate reachable while
+#       leaving cp#35 to own the body edit + fingerprint test.
+#
+#   (3) The manifest reconciler treats a DECLARED-but-not-INVOKED
+#       cap as informational, not as CAP_MANIFEST_EXTRA. See
+#       src/loader/cap_reconcile.pdx §3 for the ordering rules; the
+#       three-arm classification (missing / extra / declared) is
+#       R90-XREPO.013.M2-001 (paideia-os/shell#39).
+#
+# Retired at v1.1-A (documented for provenance; NOT in the surface
+# below):
+#
+#   KIND_IPC_ENDPOINT (invoke)              -- pipe substrate; the
+#                                              v1.2.0 semantic-pipe
+#                                              emit uses sys_semantic_
+#                                              send directly (sysno
+#                                              115), not a cap-gated
+#                                              endpoint invoke, so
+#                                              this cap does NOT
+#                                              re-appear. sys_semantic_
+#                                              send takes no cap.
+#   KIND_PDXFS_TXN    (invoke)              -- retired with the outer
+#                                              TXN wrap; the R90
+#                                              substrate uses
+#                                              KIND_PDXFS_VOL for the
+#                                              volume-scoping arg,
+#                                              not KIND_PDXFS_TXN.
 #   KIND_ELEVATE_CHANNEL (invoke,           -- retired with the cross-
 #     svc.elevate-broker)                      subtree elevate retry.
 #
-# Every one of those was a shape-in-place hook against a substrate
-# that has not landed. v1.1-A declares only what the real body
-# actually uses.
+# sys_semantic_send caveat (v1.2.0)
+# ---------------------------------
+# The sysno-115 producer path takes no cap slot at the R107-M0-001
+# landing (kernel-side confirmed at src/kernel/core/syscall/handlers/
+# sys_semantic_send.pdx line 158). If a future R107 wave adds a
+# per-schema KIND_SEMANTIC_PIPE gate for the send side, this file
+# grows a new row at that time; for now the semantic-pipe emit does
+# not require a cap.
 #
 # Format: `requires:` lists cap-kind names + narrowed rights + optional
 # scope. The caps-decl reader resolves each name to its KIND_* ordinal
@@ -45,9 +102,22 @@ requires:
   # parent path prefix at exec so cp cannot write outside the argument.
   - KIND_PDXFS_FILE (write, <dst-parent>)
 
+  # Volume reference for the outer TXN wire (paideia-os/cp#35 body
+  # edit). Narrowed to INVOKE against the destination mount. The
+  # loader resolves <mount> to the mount slot covering <dst-parent>
+  # (single-volume common case) or refuses at exec time if the mount
+  # slot is unreachable. Declared at v1.2.0 per R90-XREPO.013.M3-003
+  # (paideia-os/cp#31); invoke arm defers to cp#35.
+  - KIND_PDXFS_VOL  (invoke, <mount>)
+
 # Declared output schemas -- the semantic-pipe schema records this tool
-# emits on its stdout. v1.1-A emits none (single-file copy is silent on
-# success, prints on stderr on error). A future milestone re-introduces
-# CopyProgressRecord[] via libpdx-semantic-pipe once the substrate is
-# stable enough to justify carrying the dep.
-declares_output_schemas: (none)
+# emits on its stdout / on the sys_semantic_send ring.
+#
+# v1.2.0 adds one entry: CopyRecord@0.1 (schema tag 0x436F707952656301,
+# 24-byte record shape) emitted via sys_semantic_send (sysno 115) at
+# the successful-exit tail of copy_bytes_only. See src/pipe.pdx
+# module header for the record layout and the schema-tag derivation.
+# Consumer decoders live in libpdx-semantic-pipe once the recv side
+# lands (post-R107).
+declares_output_schemas:
+  - CopyRecord@0.1 (schema=0x436F707952656301, len=24, via=sys_semantic_send)

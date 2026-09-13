@@ -1,16 +1,31 @@
 # cp -- paideia-as build manifest
 #
-# Wave: R50  Milestone: v1.1-C (atomicity-claim retirement, doc-only)
+# Wave: R50  Milestone: v1.2.0 (Wave D drain close-out)
 #
-# v1.1-C closes paideia-os/cp#23 (`cp.ENH-007 TXN begin/commit/abort
-# are no-ops while the docs assert atomicity as fact`). No source or
-# manifest surface changes: README.md, doc/cp.pdxdoc, and
-# design/pdxfs-notes.md are updated to state honestly that cp v1.1
-# is NOT transactionally atomic, that the outer KIND_PDXFS_TXN wrap
-# retired in v1.1-A, and that the R90 kernel substrate the outer
-# wrap will re-target (sysnos 70/104/105/107) is tracked as
-# paideia-os/cp#35 rather than landing at v1.1-C. See CHANGELOG.md
-# under 1.1.0-C for the audit.
+# v1.2.0 closes the paideia-os/cp Wave D drain:
+#
+#   paideia-os/cp#31 -- caps.decl adds KIND_PDXFS_VOL declaration +
+#                       adoption note (R90-XREPO.013.M3-003).
+#   paideia-os/cp#32 -- v1.1-A real-body extraction (verified already
+#                       landed at beecb0c; closed with cite).
+#   paideia-os/cp#33 -- v1.1-B semantic-pipe emission: CopyRecord@0.1
+#                       via sys_semantic_send (sysno 115, R107-M0-001
+#                       paideia-os #2350) at the successful-exit tail
+#                       of copy_bytes_only.
+#   paideia-os/cp#34 -- v1.1-C release closer: manifest version bump,
+#                       manifest.pdxsig alignment, CHANGELOG
+#                       consolidation, PDX_TOOL_NAME/PDX_TOOL_VERSION
+#                       externs for the libpdx-argv 1.1.3 Wave 6
+#                       contract.
+#   paideia-os/cp#36 -- regression test: dst-basename-only path
+#                       relative to cwd (v1.1-B contract).
+#
+# v1.1-C (2026-09-12) closed paideia-os/cp#23 (`cp.ENH-007 TXN
+# begin/commit/abort are no-ops while the docs assert atomicity as
+# fact`) as a doc-only landing. v1.2.0 preserves that doc audit and
+# adds one new source module (src/pipe.pdx), one new tool-identity
+# stub (src/tool_ident.pdx), and one regression test
+# (tests/dst_basename_smoke.pdx).
 #
 # v1.1-B closes paideia-os/cp#21: the kernel's vfs_open O_CREAT
 # parent-scan refuses a slash-less create outright, so
@@ -39,7 +54,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step.
 
 name        = cp
-version     = 1.1.0-C
+version     = 1.2.0
 kind        = tool
 entry       = Main::cp_main
 output      = build-out/cp
@@ -50,20 +65,31 @@ doc_file    = doc/cp.pdxdoc
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
 #
-# v1.1-A source count: 5 (down from v1.0's 12). Retired modules:
-#   flags.pdx        -- no cp-owned flags at v1.1-A
-#   walk.pdx         -- no -r flag
-#   signed_inode.pdx -- cap-tail preservation stub
-#   undo.pdx         -- --over-existing undo record stub
-#   pipe.pdx         -- CopyProgressRecord schema bind + emit
-#   audit.pdx        -- libpdx-audit begin/commit wrap
-#   elevate.pdx      -- libpdx-elevate cross-subtree retry
+# v1.2.0 source count: 7 (v1.1-B: 5). Added modules:
+#   pipe.pdx         -- CopyRecord@0.1 emission via sys_semantic_send
+#                       (sysno 115, R107-M0-001 #2350) -- REAL body,
+#                       replaces the v1.0 libpdx-semantic-pipe stub
+#                       retired at v1.1-A; the module name reuses
+#                       "pipe.pdx" but the record shape (24 bytes,
+#                       CopyRecord@0.1 vs the v1.0 CopyProgressRecord
+#                       schema) is a fresh design.
+#   tool_ident.pdx   -- PDX_TOOL_NAME + PDX_TOOL_VERSION externs per
+#                       the Wave 6 libpdx-argv v1.1.3 contract
+#                       (ENH-032); resolved at link time by
+#                       VersionBackend::emit_default.
+#
+# Retired (v1.1-A): flags.pdx / walk.pdx / signed_inode.pdx / undo.pdx /
+# audit.pdx / elevate.pdx. The v1.0 pipe.pdx was retired at v1.1-A and
+# the v1.2.0 replacement is a fresh design against the sys_semantic_
+# send substrate that has since landed.
 sources:
-  - src/print.pdx      # sys_write(fd=1/2) helper
-  - src/pdxfs.pdx      # sys_open/read/write/close/stat trampolines
-  - src/copy.pdx       # real-body single-file copy (stat + open + loop + close)
-  - src/dispatch.pdx   # pos_count validate + route to copy body
-  - src/main.pdx       # cp_main(argc, argv) entry point
+  - src/print.pdx        # sys_write(fd=1/2) helper
+  - src/pdxfs.pdx        # sys_open/read/write/close/stat/getcwd trampolines
+  - src/copy.pdx         # real-body single-file copy (stat + open + loop + close + pipe emit)
+  - src/dispatch.pdx     # pos_count validate + route to copy body
+  - src/main.pdx         # cp_main(argc, argv) entry point
+  - src/pipe.pdx         # CopyRecord@0.1 semantic-pipe emit (sysno 115)
+  - src/tool_ident.pdx   # PDX_TOOL_NAME / PDX_TOOL_VERSION (Wave 6)
 
 # --- Library dependencies -----------------------------------------------
 # v1.1-A collapses the v1.0 dep list from four libraries to one:

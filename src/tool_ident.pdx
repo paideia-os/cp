@@ -1,0 +1,72 @@
+// src/tool_ident.pdx -- cp v1.2.0 (Wave 6 libpdx-argv v1.1.3 contract)
+// ToolIdent module: per-tool identity externs consumed by libpdx-argv
+// VersionBackend::emit_default (ENH-032).
+//
+// Why this file exists -- Wave 6 libpdx-argv contract
+// ---------------------------------------------------
+// libpdx-argv 1.1.3 removed the hard-coded `DOC_TOOL_NAME` /
+// `DOC_TOOL_VERSION` literals from VersionBackend::emit_default and
+// replaced them with two `UND` externs: PDX_TOOL_NAME (lowercase,
+// NUL-terminated) and PDX_TOOL_VERSION (semver, NUL-terminated).
+// Every consumer of libpdx-argv >= 1.1.3 must provide both symbols
+// at final-link time or `ld` fails with an undefined-symbol error
+// naming the missing symbol. There is deliberately no STB_WEAK
+// fallback because the pre-hotfix "doc" default would silently pass
+// under `--version` -- worse than a link-time failure.
+//
+// See tools/user/libpdx-argv/src/version_backend.pdx §60-90 for the
+// full contract and the ENH-032 hotfix rationale.
+//
+// Wire-in posture at v1.2.0
+// -------------------------
+// cp v1.2.0 registers libpdx-argv's StdVocab (which includes
+// --version) at cp_main step 1. When a user invokes `cp --version`,
+// the parser's auto-emit path calls VersionBackend::emit_default
+// which reads these two externs via `lea rdi, [rip + PDX_TOOL_NAME]`
+// / `lea rdi, [rip + PDX_TOOL_VERSION]`, prints
+// `cp <ver>\nCP VERSION OK\n`, and exits via ERR_VERSION_EMITTED (13).
+// Providing these externs preemptively (even before the upgrade to
+// libpdx-argv >= 1.1.3 in manifest.pdxproj's deps block) satisfies
+// the symbol contract for the eventual bump.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`ToolIdent`) matches file.
+//   - No function bodies -> no register plan, no push/pop parity,
+//     no encoder guardrails to enforce here.
+//   - String literals on single lines (fingerprint-extractor
+//     requirement + libpdx-argv linker resolves the symbol as-is).
+//   - Array size == literal byte count including NUL:
+//       "cp\0"   = 3 bytes
+//       "1.2.0\0" = 6 bytes
+//   - Both symbols `pub let` (public + immutable = .rodata) so the
+//     linker can resolve libpdx-argv's UND refs against them.
+
+module ToolIdent = structure {
+
+  // ============================================================================
+  // PDX_TOOL_NAME -- lowercase tool name, NUL-terminated. Read by
+  // libpdx-argv VersionBackend::emit_default at run time via the
+  // `lea rdi, [rip + PDX_TOOL_NAME]` idiom (segment 1a of the ENH-032
+  // emit_default body); the byte-count is computed via
+  // VersionBackend::version_strlen and clamped to TOOL_NAME_UPPER_MAX
+  // (32 bytes) for the uppercase mirror. "cp" fits trivially; the
+  // array is 3 bytes including NUL.
+  // ============================================================================
+  pub let PDX_TOOL_NAME : [u8; 3] = "cp\0"
+
+  // ============================================================================
+  // PDX_TOOL_VERSION -- semver, NUL-terminated. Read by libpdx-argv
+  // VersionBackend::emit_default at run time via `lea rdi, [rip +
+  // PDX_TOOL_VERSION]` (segment 1b of the ENH-032 emit_default body);
+  // the byte-count is computed via VersionBackend::version_strlen.
+  //
+  // v1.2.0 close-out release (Wave D drain: cp#31 caps.decl +
+  // KIND_PDXFS_VOL, cp#32 real body already landed at v1.1-A, cp#33
+  // semantic-pipe emission wire, cp#34 release closer, cp#36 dst-
+  // basename regression test). Keep this literal in lockstep with
+  // manifest.pdxproj `version` and manifest.pdxsig `version`.
+  // ============================================================================
+  pub let PDX_TOOL_VERSION : [u8; 6] = "1.2.0\0"
+
+}

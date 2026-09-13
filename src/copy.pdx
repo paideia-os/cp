@@ -124,13 +124,15 @@
 //
 // Cross-module externs consumed
 // -----------------------------
-//   Pdxfs::pdxfs_open   (path, flags, mode) -- 3-arg since v1.1-A
-//   Pdxfs::pdxfs_read   (fd, buf, len)
-//   Pdxfs::pdxfs_write  (fd, buf, len)
-//   Pdxfs::pdxfs_close  (fd)
-//   Pdxfs::pdxfs_stat   (path, statbuf)
-//   Pdxfs::pdxfs_getcwd (buf, buf_len)      -- new at v1.1-B
-//   Print::print_err    (buf, len)
+//   Pdxfs::pdxfs_open              (path, flags, mode)  -- 3-arg since v1.1-A
+//   Pdxfs::pdxfs_read              (fd, buf, len)
+//   Pdxfs::pdxfs_write             (fd, buf, len)
+//   Pdxfs::pdxfs_close             (fd)
+//   Pdxfs::pdxfs_stat              (path, statbuf)
+//   Pdxfs::pdxfs_getcwd            (buf, buf_len)       -- new at v1.1-B
+//   Print::print_err               (buf, len)
+//   Pipe::pipe_emit_copy_record    (bytes_copied,       -- new at v1.2.0
+//                                   src_mode)              (paideia-os/cp#33)
 
 module Copy = structure {
 
@@ -692,6 +694,22 @@ module Copy = structure {
 
         mov rdi, r14;
         call pdxfs_close;
+
+        // v1.2.0 (paideia-os/cp#33): emit CopyRecord@0.1 via sys_semantic_
+        // send (sysno 115, R107-M0-001 #2350). Best-effort observability
+        // tap for downstream semantic-pipe consumers (shell pipelines,
+        // session recorders, ring subscribers). The syscall's return
+        // (0/-EFAULT/-EINVAL) is discarded: both failure classes are
+        // marshalling bugs in src/pipe.pdx (a wrong len constant or a
+        // broken rip-relative lea for a static .bss record buffer), not
+        // per-run conditions the caller can act on. r13 still carries
+        // src_mode from the cp_mode_ready phase; bytes_copied lives in
+        // the .bss slot we accumulated into throughout the read/write
+        // loop.
+        lea r11, [rip + bytes_copied];
+        mov rdi, [r11];                        // bytes_copied
+        mov rsi, r13;                          // src_mode (from cp_mode_ready)
+        call pipe_emit_copy_record;
 
         xor rax, rax;                          // EXIT_OK (0)
         jmp cp_epilogue;

@@ -1,0 +1,233 @@
+// tests/dst_basename_smoke.pdx -- cp v1.2.0 (Closes paideia-os/cp#36)
+// TestDstBasenameSmoke: regression smoke for the v1.1-B userspace
+// cwd-relative destination resolve. Fabricates a scratch file at
+// `/tmp/dst_basename_src`, sys_chdirs into /tmp, invokes
+// copy_bytes_only with two BASENAME-ONLY paths ("dst_basename_src",
+// "dst_basename_dst"), and asserts the copy lands at
+// `/tmp/dst_basename_dst` (i.e. relative to the cwd, not the mount
+// root).
+//
+// Why this file exists
+// --------------------
+// v1.1-B added Copy::copy_resolve_dst_cwd (paideia-os/cp#21) so
+// `cd /home/alice && cp foo bar` no longer fails at the O_CREAT
+// parent-scan gate (which refuses slash-less create paths outright,
+// see src/kernel/core/fs/vfs_open.pdx `vfs_open_creat_scanned`).
+// The v1.1-B landing verified the fix by hand + through the
+// mkdir-side precedent but shipped no in-tree regression test
+// asserting the DST-BASENAME-ONLY contract holds. The 2026-09-12
+// ECOTABLE wave (paideia-os/cp#36) filed the missing test as a
+// regression tracker; this file closes that ticket.
+//
+// The test is structural in the same sense
+// tools/user/mkfs.pdxfs/tests/test_file_target_happy.pdx is (see its
+// module header): it directly calls copy_bytes_only from a driver
+// entry point rather than fork/exec-ing cp as a child. copy_bytes_only
+// is the exact function cp_main routes to after argv parse, and it
+// owns the cwd-resolve path -- exercising it directly with
+// basename-only args covers the v1.1-B contract without needing an
+// exec harness the paideia-as test-runner does not yet provide.
+//
+// The three phases
+// ----------------
+//   Phase 1 (setup). Best-effort cleanup: sys_unlink both scratch
+//     paths (ENOENT return is expected and ignored so a stale file
+//     from a prior driver run cannot bias later phases). Create the
+//     source file at `/tmp/dst_basename_src` via
+//     sys_open(O_WRONLY|O_CREAT|O_TRUNC = 0xC1, mode=0644=0x1A4),
+//     sys_write a 5-byte payload ("hello"), sys_close. sys_chdir
+//     into `/tmp` so the cwd matches the mount point cp will
+//     resolve DST against.
+//   Phase 2 (copy under cwd-relative DST). Call
+//     copy_bytes_only(&"dst_basename_src\0",
+//                     &"dst_basename_dst\0") -- both basenames, no
+//     leading slash. Assert rax == 0 (EXIT_OK). This exercises
+//     copy_resolve_dst_cwd's non-absolute path: pdxfs_getcwd fills
+//     copy_cwd_scratch with "/tmp\0", the join builds
+//     copy_dst_resolved as "/tmp/dst_basename_dst\0", and the
+//     O_CREAT sys_open lands the new file at the resolved absolute
+//     path.
+//   Phase 3 (existence assertion). sys_stat("/tmp/dst_basename_dst")
+//     -- assert rax == 0 (statbuf filled). A non-zero return means
+//     the copy did NOT land at the expected absolute path -- the
+//     regression the test exists to detect. sys_stat's absolute
+//     path here is deliberately not routed through the cwd resolve;
+//     the assertion is that the copy body's cwd resolution produced
+//     the expected filesystem-visible path.
+//
+// Return-code convention (matches this org's M4-driver convention;
+// see tools/user/mkfs.pdxfs/tests/README.md):
+//
+//   0 -- all three phases passed.
+//   1 -- Phase 1 setup failed (open, write, close, or chdir returned
+//        an error).
+//   2 -- Phase 2 failed (copy_bytes_only did not return EXIT_OK).
+//   3 -- Phase 3 failed (sys_stat on the resolved absolute path
+//        returned a negative errno -- the copy did NOT land at the
+//        expected location).
+//
+// paideia-as encoder notes
+// ------------------------
+//   - No `@no_frame` anywhere.
+//   - No `test` mnemonic; every check is `cmp reg, imm` (all
+//     immediates fit imm32 trivially -- largest is 255 for the
+//     path_len_hint on sys_unlink / sys_stat).
+//   - No `and rN, imm64` on r8-r15 (no ANDs at all).
+//   - Byte writes handled indirectly through sys_write.
+//   - Cross-module calls use bare unqualified symbol name
+//     (`call copy_bytes_only;`) per this repo's established
+//     convention -- resolved at final-link time against the
+//     copy_bytes_only symbol in src/copy.pdx.
+//   - Register plan: rbx preserved as the source-fd across
+//     sys_write / sys_close in Phase 1; every other phase reloads
+//     its scratch-path pointer via a fresh `lea` immediately
+//     before use.
+//   - Reserved-label discipline (project non-negotiable): every
+//     label prefixed `cp_test_` to avoid `loop`/`done`/`top`/`if`
+//     keyword collisions.
+//   - 1-push prologue (rbx) keeps `rsp % 16 == 0` at the nested
+//     copy_bytes_only + sys_write / sys_close / sys_stat syscall
+//     sites.
+//
+// Upstream: design/kernel/r86-m1-005.md (cwd anchoring), src/copy.pdx
+// (this repo, copy_resolve_dst_cwd + copy_bytes_only),
+// tests/README.md (this repo, return-code convention),
+// design/user/syscall-table.md (paideia-os, sysno mapping).
+
+module DstBasenameSmoke = structure {
+
+  // -- Scratch paths ---------------------------------------------------
+  // Absolute paths kept alongside the basename-only pair so Phase 1
+  // (setup + cleanup) can address the files unambiguously and Phase 3
+  // can verify the copy landed at the expected absolute location.
+
+  pub let cp_test_abs_src : [u8; 23] = "/tmp/dst_basename_src\0"
+  pub let cp_test_abs_dst : [u8; 23] = "/tmp/dst_basename_dst\0"
+
+  pub let cp_test_basename_src : [u8; 17] = "dst_basename_src\0"
+  pub let cp_test_basename_dst : [u8; 17] = "dst_basename_dst\0"
+
+  pub let cp_test_cwd : [u8; 5] = "/tmp\0"
+
+  // -- Source payload written during Phase 1 (5 bytes, no NUL). -------
+  pub let cp_test_payload : [u8; 5] = "hello"
+
+  // -- .bss statbuf for Phase 3's existence check (64-byte layout per
+  //    src/kernel/core/syscall/handlers/sys_stat.pdx §Layout). --------
+  pub let mut cp_test_statbuf : [u8; 64] = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Drives all three phases. See module header for the full contract.
+  // ==========================================================================
+  pub let run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "cp v1.2.0 dst-basename regression driver (Closes paideia-os/cp#36). Exercises copy_bytes_only's Step 0.5 (copy_resolve_dst_cwd) with two BASENAME-ONLY paths after a sys_chdir into /tmp: the assertion is that the copy lands at /tmp/dst_basename_dst (i.e. relative to the cwd, not the mount root) proving the v1.1-B O_CREAT parent-scan gap (paideia-os/cp#21) stays closed. Phase 1: best-effort sys_unlink (sysno 81, path_len_hint=255) both scratch paths -- ENOENT return ignored so a stale leftover cannot bias later phases; then sys_open(&cp_test_abs_src, O_WRONLY|O_CREAT|O_TRUNC=0xC1, mode=0644=0x1A4) via sysno 2, sys_write(fd, &cp_test_payload, 5) via sysno 1, sys_close(fd) via sysno 3, sys_chdir(&cp_test_cwd) via sysno 85 -- any negative return aborts to cp_test_fail_phase1 (returns 1). Phase 2: call copy_bytes_only(&cp_test_basename_src, &cp_test_basename_dst) via bare symbol reference; assert rax==0 (EXIT_OK) or fall through to cp_test_fail_phase2 (returns 2). Phase 3: sys_stat(&cp_test_abs_dst, &cp_test_statbuf) via sysno 77 -- the arity-3 sys_stat trampoline shape (rdi=path_va, rsi=path_len_hint=255, rdx=stat_buf_va); assert rax==0 or fall through to cp_test_fail_phase3 (returns 3). All three phases passing falls through to xor rax,rax + ret. Register plan: rbx = source fd across Phase 1's sys_write + sys_close (callee-save preserved through the syscall pair, no push/pop needed for this single-use). No cross-call rax preservation needed anywhere else -- every phase's assertion happens immediately after the syscall returns before any other register is repurposed. 1-push prologue (rbx) keeps rsp%16==0 at every nested syscall + call site. No test mnemonic; every zero-check via cmp reg,0 or cmp reg,imm. Every cmp imm fits imm16 (largest 255). No ANDs. Reserved-label discipline: every branch label prefixed cp_test_.",
+      block: {
+        // ---- Prologue -------------------------------------------------------
+        push rbx;                              // rsp%16: 8 -> 0
+
+        // ================================================================
+        // Phase 1: setup -- unlink, create source, chdir into /tmp.
+        // ================================================================
+
+        // ---- Best-effort cleanup: sys_unlink both scratch paths ---------
+        lea rdi, [rip + cp_test_abs_src];
+        mov rsi, 255;                          // path_len_hint (walker cap)
+        mov rax, 81;                           // sys_unlink
+        syscall;
+
+        lea rdi, [rip + cp_test_abs_dst];
+        mov rsi, 255;
+        mov rax, 81;
+        syscall;
+
+        // ---- Create source: sys_open(path, 0xC1, 0x1A4) -----------------
+        lea rdi, [rip + cp_test_abs_src];
+        mov rsi, 0xC1;                         // O_WRONLY|O_CREAT|O_TRUNC
+        mov rdx, 0x1A4;                        // mode 0644
+        mov rax, 2;                            // sys_open
+        syscall;
+        cmp rax, 0;
+        jl cp_test_fail_phase1;
+
+        mov rbx, rax;                          // rbx = source fd
+
+        // ---- sys_write(fd, payload, 5) ----------------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + cp_test_payload];
+        mov rdx, 5;
+        mov rax, 1;                            // sys_write
+        syscall;
+        cmp rax, 0;
+        jl cp_test_fail_phase1;
+
+        // ---- sys_close(fd) ----------------------------------------------
+        mov rdi, rbx;
+        mov rax, 3;                            // sys_close
+        syscall;
+        cmp rax, 0;
+        jl cp_test_fail_phase1;
+
+        // ---- sys_chdir("/tmp") ------------------------------------------
+        // sys_chdir ring-3 shape per the shell v2.0 SC+ ID 85 shim
+        // (tools/user/shell/src/syscall.pdx sys_chdir): SysV rdi/rsi
+        // pass-through -- rdi = path_va, rsi = path_len_hint (255 is
+        // the standard walker CAP). syscall_entry.pdx shuffles the
+        // Linux SYSCALL ABI (rdi=a0, rsi=a1) to the C ABI dispatch_
+        // chdir consumes (rdi=sysno post-shuffle; rsi=a0=path_va;
+        // rdx=a1=path_len).
+        lea rdi, [rip + cp_test_cwd];
+        mov rsi, 255;
+        mov rax, 85;                           // sys_chdir
+        syscall;
+        cmp rax, 0;
+        jl cp_test_fail_phase1;
+
+        // ================================================================
+        // Phase 2: copy under cwd-relative DST -- basename-only args.
+        // ================================================================
+        lea rdi, [rip + cp_test_basename_src];
+        lea rsi, [rip + cp_test_basename_dst];
+        call copy_bytes_only;
+        cmp rax, 0;
+        jne cp_test_fail_phase2;
+
+        // ================================================================
+        // Phase 3: existence assertion -- stat /tmp/dst_basename_dst.
+        // ================================================================
+        // sys_stat's arity-3 ring-3 shape (see src/pdxfs.pdx pdxfs_stat
+        // for the trampoline that shuffles a 2-arg caller ABI to the
+        // kernel's 3-arg shape).
+        lea rdi, [rip + cp_test_abs_dst];
+        mov rsi, 255;                          // path_len_hint
+        lea rdx, [rip + cp_test_statbuf];
+        mov rax, 77;                           // sys_stat
+        syscall;
+        cmp rax, 0;
+        jne cp_test_fail_phase3;
+
+        // ---- All three phases passed -----------------------------------
+        xor rax, rax;                          // 0 = pass
+        pop rbx;
+        ret;
+
+      cp_test_fail_phase1:
+        mov rax, 1;
+        pop rbx;
+        ret;
+
+      cp_test_fail_phase2:
+        mov rax, 2;
+        pop rbx;
+        ret;
+
+      cp_test_fail_phase3:
+        mov rax, 3;
+        pop rbx;
+        ret
+      }
+    }
+}

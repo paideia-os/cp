@@ -7,6 +7,156 @@ and every issue it lands, so the release-tag ↔ code-tree ↔ issue-
 graph triangulation the signing pipeline uses at `paideia-as
 release --sign` time is reproducible from this file alone.
 
+## 1.2.0 — 2026-09-13 (Wave D drain close-out)
+
+Closes paideia-os/cp#31 (`R90-XREPO.013.M3-003 cp — caps.decl +
+adoption`), paideia-os/cp#32 (`v1.1-A real-body extraction` --
+verified already landed at beecb0c, closed with cite),
+paideia-os/cp#33 (`v1.1-B Semantic-pipe emission wire`),
+paideia-os/cp#34 (`v1.1-C Release closer + tag`), and
+paideia-os/cp#36 (`regression test: dst-basename-only path relative
+to cwd`).
+
+Consolidates the Wave D drain into a single v1.2.0 release rather
+than the four sub-tags (v1.1-A/B/C) originally scoped for Track C.
+Grounds: v1.1-A landed at beecb0c and v1.1-B / v1.1-C landed at
+successive commits during the R90 sweep; the semantic-pipe wire
+(this release) is functionally additive over that stack, and the
+tool-identity externs (Wave 6 libpdx-argv v1.1.3 contract) plus
+the KIND_PDXFS_VOL declaration (R90-XREPO.013.M3-003) constitute a
+minor-version bump under semver rather than three chained patch
+releases.
+
+### Added
+
+- `src/pipe.pdx` -- new REAL body semantic-pipe emit module.
+  `Pipe::pipe_emit_copy_record(bytes_copied, src_mode)` marshals a
+  24-byte CopyRecord@0.1 (bytes_copied u64@+0, src_mode u64@+8,
+  tsc_ticks u64@+16) into a static `.bss` scratch buffer and
+  invokes `sys_semantic_send` (sysno 115, R107-M0-001 paideia-os
+  #2350) with schema tag `0x436F707952656301` (LE-packed
+  "CopyRec\x01"; low byte is the version marker). Consumer decoders
+  live in libpdx-semantic-pipe once the recv side lands (post-R107).
+  Best-effort emission: return value from `sys_semantic_send` is
+  discarded (both -EFAULT and -EINVAL are marshalling bugs in this
+  file, not per-run conditions the caller can act on -- pdxsock
+  v1.1-B precedent at `tools/user/pdxsock/src/main.pdx` L1929).
+- `src/tool_ident.pdx` -- new module. `PDX_TOOL_NAME : [u8; 3] =
+  "cp\0"` and `PDX_TOOL_VERSION : [u8; 6] = "1.2.0\0"` externs per
+  the Wave 6 libpdx-argv v1.1.3 contract (ENH-032, closes the UND
+  symbol requirement that landed with libpdx-argv 1.1.3). Resolved
+  at final-link time by `VersionBackend::emit_default`; `cp
+  --version` now prints `cp 1.2.0\nCP VERSION OK\n` once the
+  libpdx-argv dep bumps to >= 1.1.3.
+- `src/copy.pdx::copy_bytes_only` -- new emit block at the
+  `cp_eof` success arm: `lea r11, [rip + bytes_copied]; mov rdi,
+  [r11]; mov rsi, r13; call pipe_emit_copy_record;` sits between
+  the two `sys_close` calls and the `xor rax, rax; jmp cp_epilogue`
+  tail. `r13` still carries `src_mode` from the `cp_mode_ready`
+  phase (callee-save preserved through every intervening call);
+  `bytes_copied` reads its accumulated total from the module `.bss`
+  slot the read/write loop stamped into.
+- `caps.decl` -- new `KIND_PDXFS_VOL (invoke, <mount>)` row per
+  R90-XREPO.013.M3-003 (paideia-os/cp#31). DECLARATION + ADOPTION
+  NOTE only; the invoke arm lands under paideia-os/cp#35 body
+  edit (outer TXN re-wire against the R90 kernel substrate
+  sysnos 70/104/105/107). Landing the declaration now (rather
+  than at cp#35 landing) means the manifest reconciler will not
+  fail-fast with `CAP_MANIFEST_MISSING` when cp#35's first
+  `pdxfs_txn_open` call site lands -- the cap is already declared;
+  only the invoke happens later.
+- `caps.decl declares_output_schemas:` -- new
+  `CopyRecord@0.1 (schema=0x436F707952656301, len=24,
+  via=sys_semantic_send)` entry. Consumed by the InitCap sidecar
+  packaging step for the loader-side output-schema advertisement.
+- `tests/dst_basename_smoke.pdx` -- new regression driver
+  (`TestDstBasenameSmoke::run`). Closes paideia-os/cp#36 (the
+  missing test for the v1.1-B cwd-relative dst contract). Three
+  phases: (1) setup -- unlink + create source at
+  `/tmp/dst_basename_src`, chdir into `/tmp`; (2) call
+  `copy_bytes_only("dst_basename_src", "dst_basename_dst")` --
+  both basenames, no leading slash; (3) `sys_stat` on
+  `/tmp/dst_basename_dst` asserts the copy landed at the
+  cwd-relative absolute path. Return codes 0/1/2/3 per this org's
+  M4-driver convention.
+
+### Changed
+
+- `manifest.pdxproj` -- `version = 1.1.0-C` -> `version = 1.2.0`;
+  source list expanded from 5 to 7 (adds `src/pipe.pdx` +
+  `src/tool_ident.pdx`); header comment describes the Wave D drain
+  scope.
+- `manifest.pdxsig` -- `version = 1.0.0` -> `version = 1.2.0`;
+  `release_date` -> `2026-09-13`; `paideia_as_min` bumped
+  `0.33 -> 0.36` to match the encoder-discipline floor the current
+  source tree targets (mov_b + mov_d + @align).
+
+### Behavioural contract
+
+- Every completed `cp SRC DST` invocation (regardless of whether
+  DST was absolute, relative, or resolved to a directory) now emits
+  ONE `CopyRecord@0.1` (24 bytes) to the kernel-side
+  `sys_semantic_send` ring at the successful-exit tail of
+  `copy_bytes_only`. The record shape is stable across future
+  layout extensions -- consumers match on the leading 56 bits of
+  the schema tag and use the ring slot's `len` header to detect
+  layout-version drift.
+- Failure branches (parse error, wrong pos_count, stat/open/read/
+  write failure, dst-path overflow, cwd-resolve overflow, short
+  write) emit NO record -- there is no "session" to describe when
+  the copy did not complete. This mirrors the pdxsock v1.1-B
+  precedent: emit only on the completed-path tail.
+- `--version` continues to route through libpdx-argv's `StdVocab`
+  (as it has since v1.1-A). Once the tool's deps bump to
+  libpdx-argv >= 1.1.3, `VersionBackend::emit_default` reads the
+  new `PDX_TOOL_NAME` + `PDX_TOOL_VERSION` externs and emits
+  `cp 1.2.0\nCP VERSION OK\n` on stdout.
+
+### Discipline (paideia-as v0.36+ / feedback_pdx_encoder_pitfalls)
+
+- No `test rN, rN` -- every zero-check via `cmp reg, 0`.
+- No `and rN, imm64` on r8-r15 (no ANDs in the new modules at all).
+- No 2-op `imul r, imm`.
+- Schema tag `0x436F707952656301` uses `mov r64, imm64` (movabs;
+  paideia-as auto-selects the REX+imm64 encoding for immediates >
+  0x7FFFFFFF).
+- `rdtsc` reconstruction pattern (`shl rdx, 32; or rax, rdx`) per
+  src/kernel/core/fs/pdxfs_lite/uuid.pdx.
+- Module basenames PascalCase (`Pipe`, `ToolIdent`,
+  `TestDstBasenameSmoke`) match file basename.
+- Reserved-label discipline: `cp_test_` prefix throughout
+  `dst_basename_smoke.pdx`; no branch labels in `pipe.pdx` /
+  `tool_ident.pdx`.
+- Pipe emit block in `copy.pdx` is a bare 3-instruction sequence
+  ahead of `xor rax, rax`, no new labels introduced -- keeps the
+  `cp_` label discipline of the enclosing function intact.
+
+### Not changed
+
+- `src/print.pdx`, `src/pdxfs.pdx`, `src/dispatch.pdx`,
+  `src/main.pdx` -- byte-identical to v1.1.0-C. The
+  semantic-pipe emit adds one bare `call pipe_emit_copy_record`
+  inside `copy.pdx::copy_bytes_only::cp_eof` and one comment
+  block; no other source file is touched.
+- v1.1.0-C's atomicity-claim retirement (README.md,
+  doc/cp.pdxdoc, design/pdxfs-notes.md) stands. `cp` is still NOT
+  transactionally atomic at v1.2.0; the outer TXN re-wire against
+  the R90 substrate (sysnos 70/104/105/107) remains tracked at
+  paideia-os/cp#35 alongside the KIND_PDXFS_VOL invoke arm this
+  release only declares.
+
+### Follow-up
+
+- paideia-os/cp#35 (`cp.ENH-011`) -- outer TXN re-wire against the
+  R90 substrate. Now unblocked on the cap-manifest side: the
+  `KIND_PDXFS_VOL (invoke, <mount>)` row this release declares
+  is exactly the cap `pdxfs_txn_open(vol_slot, flags)` will
+  consume.
+- Consumer decoders for `CopyRecord@0.1` -- deferred to whichever
+  R107 wave lands the sys_semantic_recv counterpart. The record
+  shape declared at this release is the wire contract those
+  decoders must match.
+
 ## 1.1.0-C — 2026-09-12 (atomicity-claim retirement, doc-only)
 
 Closes paideia-os/cp#23 (`cp.ENH-007 TXN begin/commit/abort are
