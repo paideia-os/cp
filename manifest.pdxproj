@@ -1,5 +1,16 @@
 # cp -- paideia-as build manifest
 #
+# Wave: R90-XREPO  Milestone: v1.3.0 (outer TXN wrap, paideia-os/cp#35)
+#
+# v1.3.0 adds src/pdxfs_txn.pdx (5 trampolines against the landed R90
+# KIND_PDXFS_TXN substrate: pdxfs_txn_begin/bind/add_write/commit/
+# abort, sysnos 70/104/105/107 -- see that file's header for the full
+# sysno reconciliation) and wraps CopyFile::copy_bytes_only's read/
+# write loop in a best-effort outer TXN. No loader-side KIND_PDXFS_VOL
+# slot-discovery mechanism exists yet, so pdxfs_txn_begin is called
+# with a stub parent_slot and is expected to fail today; any failure
+# degrades cleanly to the pre-#35 non-transactional body.
+#
 # Wave: R50  Milestone: v1.2.0 (Wave D drain close-out)
 #
 # v1.2.0 closes the paideia-os/cp Wave D drain:
@@ -54,7 +65,7 @@
 # build-out/cp.caps for the InitCap sidecar packaging step.
 
 name        = cp
-version     = 1.2.0
+version     = 1.3.0
 kind        = tool
 entry       = Main::cp_main
 output      = build-out/cp
@@ -85,7 +96,8 @@ doc_file    = doc/cp.pdxdoc
 sources:
   - src/print.pdx        # sys_write(fd=1/2) helper
   - src/pdxfs.pdx        # sys_open/read/write/close/stat/getcwd trampolines
-  - src/copy.pdx         # real-body single-file copy (stat + open + loop + close + pipe emit)
+  - src/pdxfs_txn.pdx    # outer TXN trampolines: begin/bind/add_write/commit/abort (cp#35)
+  - src/copy.pdx         # real-body single-file copy (stat + open + loop + close + pipe emit + TXN wrap)
   - src/dispatch.pdx     # pos_count validate + route to copy body
   - src/main.pdx         # cp_main(argc, argv) entry point
   - src/pipe.pdx         # CopyRecord@0.1 semantic-pipe emit (sysno 115)

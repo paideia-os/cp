@@ -1,5 +1,25 @@
-// src/copy.pdx -- cp v1.1-B (userspace cwd-relative dst resolution)
+// src/copy.pdx -- cp v1.3.0 (best-effort outer TXN wrap)
 // CopyFile module: single-file copy body.
+//
+// v1.3.0 delta (paideia-os/cp#35)
+// -------------------------------
+// Wraps the existing real-body copy loop in a best-effort outer TXN:
+// Step 4.5 (right after both fds are open) calls PdxfsTxn::
+// pdxfs_txn_begin against the R90 substrate (sysno 70). Since no
+// loader-side KIND_PDXFS_VOL slot-discovery mechanism exists yet
+// (see src/pdxfs_txn.pdx module header), the parent_slot argument is
+// a documented stub (0) that is expected to fail the mint gate today
+// -- ANY negative return from pdxfs_txn_begin degrades gracefully to
+// the pre-#35 non-transactional body (r12 is set to the -1 sentinel
+// and every downstream TXN call is skipped), so this landing cannot
+// regress a single currently-passing invocation. When a TXN IS open
+// (r12 holds a valid cap_slot in [0,256)), every write block threads
+// through PdxfsTxn::pdxfs_txn_add_write (sysno 107, sys_pdxfs_undo_
+// write) before its byte count is accumulated, the success tail
+// calls PdxfsTxn::pdxfs_txn_commit (sysno 104), and every failure
+// branch reached after Step 4.5 (read/write/short-write) calls
+// PdxfsTxn::pdxfs_txn_abort (sysno 105) before its existing close +
+// diagnostic logic runs.
 //
 // v1.1-B delta (paideia-os/cp#21)
 // -------------------------------
@@ -93,11 +113,16 @@
 //   rbx = src_ptr (Phase 1-3; dead by open-src). Reused Phase 5+ as
 //         bytes-read n across the pdxfs_write call.
 //   r12 = dst_ptr (Phase 1-4; may be rewritten to &copy_dst_path).
-//         Dead by open-dst.
-//   r13 = src mode word (Phase 3-4; dead after open-dst). Free
-//         thereafter.
+//         Dead by open-dst. Reused from Step 4.5 (paideia-os/cp#35)
+//         as either the outer TXN cap_slot ([0,256)) or the
+//         TXN_INACTIVE sentinel (-1); every add_write/commit/abort
+//         call site gates on `cmp r12, 0; jl` before touching it.
+//   r13 = src mode word (Phase 3-4 through the cp_eof pipe emit;
+//         live for the whole function body, unlike r12/rbx).
 //   r14 = fd_src (from open-src through close in every arm).
 //   r15 = fd_dst (from open-dst through close in every arm).
+//   r9  = transient dst inode_no at Step 4.5 only (dead once
+//         pdxfs_txn_bind consumes it; paideia-os/cp#35).
 //   rax = call return / temp
 //   rcx = accumulator scratch (bytes_copied +=)
 //   rdi, rsi, rdx = nested-call arg carriers
@@ -133,6 +158,13 @@
 //   Print::print_err               (buf, len)
 //   Pipe::pipe_emit_copy_record    (bytes_copied,       -- new at v1.2.0
 //                                   src_mode)              (paideia-os/cp#33)
+//   PdxfsTxn::pdxfs_txn_begin      (parent, mode, id,   -- new at v1.3.0
+//                                   wal_off)               (paideia-os/cp#35)
+//   PdxfsTxn::pdxfs_txn_bind       (cap_slot, inode_no)    (paideia-os/cp#35)
+//   PdxfsTxn::pdxfs_txn_add_write  (offset, len, buf)      (paideia-os/cp#35)
+//   PdxfsTxn::pdxfs_txn_commit     (cap_slot)               (paideia-os/cp#35)
+//   PdxfsTxn::pdxfs_txn_abort      (cap_slot)               (paideia-os/cp#35)
+//   PdxfsTxn::pdxfs_txn_alloc_id   ()                       (paideia-os/cp#35)
 
 module Copy = structure {
 
@@ -159,6 +191,19 @@ module Copy = structure {
   pub let mut fd_src        : u64 = uninit @align(8)
   pub let mut fd_dst        : u64 = uninit @align(8)
   pub let mut bytes_copied  : u64 = uninit @align(8)
+
+  // v1.3.0 (paideia-os/cp#35): re-stat scratch for the destination
+  // inode number (fed to PdxfsTxn::pdxfs_txn_bind) and the per-block
+  // write-offset staging slot (snapshotted from bytes_copied BEFORE
+  // each pdxfs_write so PdxfsTxn::pdxfs_txn_add_write sees the
+  // offset the block landed at, not the post-write total).
+  pub let mut copy_dst_ino_stat    : [u8; 64] = uninit @align(8)
+  pub let mut copy_txn_write_offset : u64     = uninit @align(8)
+
+  // -1 sentinel (0xFFFFFFFFFFFFFFFF) for "no TXN active this run" --
+  // any real cap_slot is in [0, 256), so `cmp r12, 0; jl` cleanly
+  // distinguishes the sentinel from a live slot.
+  pub let TXN_INACTIVE : u64 = 0xFFFFFFFFFFFFFFFF
 
   // -- Open-flag constants (mirror src/kernel/core/fs/vfs_open.pdx) --
   pub let O_RDONLY_V         : u64 = 0
@@ -549,7 +594,7 @@ module Copy = structure {
   pub let copy_bytes_only : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (src_ptr: u64) (dst_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp v1.1-A copy_bytes_only. Real body: sys_stat(dst)->maybe-basename-join, sys_stat(src)->extract mode, sys_open(src, O_RDONLY, 0), sys_open(effective_dst, 0xC1, src_mode), read/write loop over 4KiB copy_buf until EOF, sys_close(dst) + sys_close(src). Returns 0 on success, or the raw negative-errno u64 from the failing syscall on any failure (caller uses `cmp rax, 0; jl err` per the paideia-os convention). 5-push prologue (rbx=src_ptr then n, r12=dst_ptr, r13=src_mode then free, r14=fd_src, r15=fd_dst) lands rsp%16==0 at every nested call site. Registers cross at least one pdxfs_* call and therefore live in callee-save regs. Error branches close whatever fds are open (0/1/2 fds) and preserve the syscall's raw -errno rax as the returned exit code, printing a one-line stderr diagnostic through Print::print_err. Every cmp reg,imm uses immediate <= 0x7FFFFFFF (0xC1 open flags, 0x4000 S_IFDIR, 4096 buf len). S_IFMT_MASK=0xF000 and DEFAULT_MODE=0x1A4 are also <= 0x7FFFFFFF but staged through r11 for the `and`/comparison consistency. S_IFDIR check uses `cmp rcx, 0x4000` (imm32 fits). DST-not-a-directory (stat fails OR mode & S_IFMT != S_IFDIR) leaves dst_ptr in r12 unchanged. On DST-is-a-dir, copy_join_dir_basename rewrites copy_dst_path and r12 is updated to &copy_dst_path. Src stat mode extracted via `mov_d rax, [statbuf+24]` (u32 mode word zero-extended); mode==0 (tmpfs adapter fills 0) defaults to 0644 to leave sensible perms on a tmpfs target. sysreg effect for the SYSCALL clobber (rcx/r11). All labels prefixed cp_ to avoid `loop`/`done`/`top` keyword collisions.",
+      justification: "cp v1.1-A copy_bytes_only. Real body: sys_stat(dst)->maybe-basename-join, sys_stat(src)->extract mode, sys_open(src, O_RDONLY, 0), sys_open(effective_dst, 0xC1, src_mode), read/write loop over 4KiB copy_buf until EOF, sys_close(dst) + sys_close(src). Returns 0 on success, or the raw negative-errno u64 from the failing syscall on any failure (caller uses `cmp rax, 0; jl err` per the paideia-os convention). 5-push prologue (rbx=src_ptr then n, r12=dst_ptr, r13=src_mode then free, r14=fd_src, r15=fd_dst) lands rsp%16==0 at every nested call site. Registers cross at least one pdxfs_* call and therefore live in callee-save regs. Error branches close whatever fds are open (0/1/2 fds) and preserve the syscall's raw -errno rax as the returned exit code, printing a one-line stderr diagnostic through Print::print_err. Every cmp reg,imm uses immediate <= 0x7FFFFFFF (0xC1 open flags, 0x4000 S_IFDIR, 4096 buf len). S_IFMT_MASK=0xF000 and DEFAULT_MODE=0x1A4 are also <= 0x7FFFFFFF but staged through r11 for the `and`/comparison consistency. S_IFDIR check uses `cmp rcx, 0x4000` (imm32 fits). DST-not-a-directory (stat fails OR mode & S_IFMT != S_IFDIR) leaves dst_ptr in r12 unchanged. On DST-is-a-dir, copy_join_dir_basename rewrites copy_dst_path and r12 is updated to &copy_dst_path. Src stat mode extracted via `mov_d rax, [statbuf+24]` (u32 mode word zero-extended); mode==0 (tmpfs adapter fills 0) defaults to 0644 to leave sensible perms on a tmpfs target. sysreg effect for the SYSCALL clobber (rcx/r11). All labels prefixed cp_ to avoid `loop`/`done`/`top` keyword collisions. v1.3.0 (paideia-os/cp#35) adds a best-effort outer TXN wrap at Step 4.5: r12 (dead after open-dst) is repurposed to hold either a live PdxfsTxn cap_slot or the TXN_INACTIVE (-1) sentinel; every add_write/commit/abort call site gates on `cmp r12, 0; jl` so a failed pdxfs_txn_begin (expected today -- see src/pdxfs_txn.pdx for why) degrades cleanly to the pre-#35 body with zero behavioural change.",
       block: {
         // ---- Prologue --------------------------------------------------------
         push rbx;                              // rsp%16: 8 -> 0
@@ -652,6 +697,41 @@ module Copy = structure {
         lea r11, [rip + fd_dst];
         mov [r11], rax;
 
+        // ---- Step 4.5: begin outer TXN, best-effort (paideia-os/cp#35) -----
+        // r12 (effective dst path) is dead from here on -- repurposed to
+        // hold either the live cap_slot or the TXN_INACTIVE sentinel
+        // (-1) for the rest of this function. Any failure along this
+        // probe (stat or txn_begin) falls through to cp_txn_inactive
+        // and the copy proceeds exactly as it did before v1.3.0.
+        mov rdi, r12;                          // effective dst path
+        lea rsi, [rip + copy_dst_ino_stat];
+        call pdxfs_stat;
+        cmp rax, 0;
+        jl cp_txn_inactive;
+
+        lea r11, [rip + copy_dst_ino_stat];
+        mov rax, [r11 + 0];                    // ino u64 @ +0
+        mov r9, rax;                           // r9 = dst inode_no (transient)
+
+        xor rdi, rdi;                          // parent_slot = PDXFS_TXN_PARENT_STUB (0)
+        mov rsi, 2;                            // PXT_MODE_MODIFY
+        call pdxfs_txn_alloc_id;
+        mov rdx, rax;                          // txn_id (non-zero, monotonic)
+        xor rcx, rcx;                          // wal_off = 0
+        call pdxfs_txn_begin;
+        cmp rax, 0;
+        jl cp_txn_inactive;
+
+        mov r12, rax;                          // r12 = txn cap_slot
+        mov rdi, r12;
+        mov rsi, r9;                           // dst inode_no
+        call pdxfs_txn_bind;
+        jmp cp_txn_ready;
+
+      cp_txn_inactive:
+        mov r12, 0xFFFFFFFFFFFFFFFF;           // TXN_INACTIVE sentinel
+
+      cp_txn_ready:
         // ---- Step 5: read/write loop ---------------------------------------
       cp_loop_head:
         mov rdi, r14;                          // fd_src
@@ -665,6 +745,15 @@ module Copy = structure {
 
         mov rbx, rax;                          // rbx = n (bytes read)
 
+        // Snapshot the current bytes_copied total as THIS block's
+        // destination offset, staged through .bss (not a register) so
+        // it survives the pdxfs_write call regardless of that
+        // trampoline's own scratch usage. paideia-os/cp#35.
+        lea r11, [rip + bytes_copied];
+        mov rax, [r11];
+        lea r11, [rip + copy_txn_write_offset];
+        mov [r11], rax;
+
         mov rdi, r15;                          // fd_dst
         lea rsi, [rip + copy_buf];
         mov rdx, rbx;                          // len = n
@@ -676,10 +765,30 @@ module Copy = structure {
         cmp rax, rbx;                          // bytes_written < n?
         jl cp_short_write;
 
-        // Accumulate bytes_copied += rax.
+        // ---- TXN add_write, best-effort (paideia-os/cp#35) ------------------
+        // r12 < 0 (TXN_INACTIVE sentinel) skips this block entirely.
+        cmp r12, 0;
+        jl cp_txn_add_write_done;
+        lea r11, [rip + copy_txn_write_offset];
+        mov rdi, [r11];                        // offset
+        mov rsi, rbx;                          // len = n
+        lea rdx, [rip + copy_buf];             // kbuf_ptr
+        call pdxfs_txn_add_write;
+        // Return value is best-effort observability only at this
+        // landing (see src/pdxfs_txn.pdx pdxfs_txn_add_write header);
+        // a negative rax here does not abort the copy -- the outer
+        // commit-on-success / abort-on-hard-failure contract governs.
+      cp_txn_add_write_done:
+
+        // Accumulate bytes_copied += rbx. Uses rbx (== n, the block
+        // size) rather than rax: the intervening pdxfs_txn_add_write
+        // call (when a TXN is active) overwrites rax with its own
+        // 0-or-errno return, and the short-write branch above already
+        // guarantees rax == rbx on this path, so rbx is the correct
+        // and clobber-safe accumulator source. paideia-os/cp#35.
         lea r11, [rip + bytes_copied];
         mov rcx, [r11];
-        add rcx, rax;
+        add rcx, rbx;
         mov [r11], rcx;
 
         jmp cp_loop_head;
@@ -694,6 +803,20 @@ module Copy = structure {
 
         mov rdi, r14;
         call pdxfs_close;
+
+        // ---- TXN commit, best-effort (paideia-os/cp#35) ---------------------
+        // r12 < 0 (TXN_INACTIVE sentinel) skips the commit entirely --
+        // matches the pre-#35 body when no TXN could be opened.
+        cmp r12, 0;
+        jl cp_txn_commit_done;
+        mov rdi, r12;
+        call pdxfs_txn_commit;
+        // Commit failure at the success tail is a substrate anomaly,
+        // not a copy failure -- the file's bytes are already durable
+        // via the ordinary sys_write path regardless of TXN outcome.
+        // Return value discarded per that reasoning (matches every
+        // other best-effort tap in this function).
+      cp_txn_commit_done:
 
         // v1.2.0 (paideia-os/cp#33): emit CopyRecord@0.1 via sys_semantic_
         // send (sysno 115, R107-M0-001 #2350). Best-effort observability
@@ -791,6 +914,12 @@ module Copy = structure {
 
       cp_read_fail:
         mov rbx, rax;
+        // TXN abort, best-effort (paideia-os/cp#35). r12 < 0 skips.
+        cmp r12, 0;
+        jl cp_read_fail_no_txn;
+        mov rdi, r12;
+        call pdxfs_txn_abort;
+      cp_read_fail_no_txn:
         mov rdi, r15;
         call pdxfs_close;
         mov rdi, r14;
@@ -804,6 +933,11 @@ module Copy = structure {
 
       cp_write_fail:
         mov rbx, rax;
+        cmp r12, 0;
+        jl cp_write_fail_no_txn;
+        mov rdi, r12;
+        call pdxfs_txn_abort;
+      cp_write_fail_no_txn:
         mov rdi, r15;
         call pdxfs_close;
         mov rdi, r14;
@@ -818,6 +952,11 @@ module Copy = structure {
       cp_short_write:
         // Short write: no distinct errno, use -EIO (-5) as the sentinel
         // so callers' `jl err` gate fires. Close both fds.
+        cmp r12, 0;
+        jl cp_short_write_no_txn;
+        mov rdi, r12;
+        call pdxfs_txn_abort;
+      cp_short_write_no_txn:
         mov rdi, r15;
         call pdxfs_close;
         mov rdi, r14;

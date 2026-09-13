@@ -1,0 +1,269 @@
+// src/pdxfs_txn.pdx -- cp v1.3.0 outer-TXN trampolines (paideia-os/cp#35)
+// PdxfsTxn module: real trampolines for the R90 KIND_PDXFS_TXN
+// substrate, plus the small per-copy binding state copy_bytes_only
+// needs to thread cap_slot + inode_no through the per-block write
+// loop without exceeding the 4-curried-arg ceiling.
+//
+// Sysno reconciliation note
+// --------------------------
+// The dispatch prompt that seeded this landing assumed a mapping
+// (begin=70, add_write=106, commit=107, abort=108, status=109,
+// free=110) copied forward from a generic tooling template. Cross-
+// checked against the ACTUAL landed kernel substrate at paideia-os
+// src/kernel/core/syscall/dispatch.pdx + handlers/sys_pdxfs_txn_*.pdx
+// (R90-XREPO.010 M1-003/M1-004, paideia-os #2111/#2112), the real
+// sysnos are:
+//
+//   70  sys_pdxfs_txn_open(parent_slot, mode, txn_id, wal_off)
+//                                                -> cap_slot | errno
+//   104 sys_pdxfs_txn_commit(cap_slot)           -> 0 | errno
+//   105 sys_pdxfs_txn_abort(cap_slot)            -> 0 | errno
+//   106 sys_pdxfs_stat_by_inode(ino, out_stat)   -- UNRELATED syscall,
+//                                                   NOT a txn op
+//   107 sys_pdxfs_undo_write(cap_slot, inode_no,
+//         offset, len, kbuf_ptr)                 -> 0 | errno
+//
+// This module wires the four that exist (70/104/105/107 -- add_write
+// below is sys_pdxfs_undo_write, the closest landed primitive to a
+// per-block "declare this write to the txn" op) and stops short of
+// fabricating status/free trampolines against sysnos 108-110, which
+// have no kernel body today (calling an unrouted sysno either falls
+// through dispatch.pdx's default arm or, worse, could someday collide
+// with a real future assignment). cp's own CHANGELOG.md (v1.1.0-C /
+// v1.2.0 Follow-up sections) already documents this exact 70/104/
+// 105/107 substrate shape independently of this dispatch, which is
+// the corroborating source this reconciliation trusts.
+//
+// parent_slot (no loader wiring yet)
+// -----------------------------------
+// sys_pdxfs_txn_open wants a KIND_MEMORY cap the mount owns as
+// parent_slot. caps.decl declares KIND_PDXFS_VOL (invoke, <mount>)
+// for exactly this (R90-XREPO.013.M3-003, paideia-os/cp#31) but the
+// loader-side cap-slot-discovery syscall that would hand cp the real
+// slot number does not exist anywhere in this tree yet (no
+// src/loader/cap_reconcile.pdx, no sys_cap_lookup). pdxfs_txn_begin
+// is therefore called with parent_slot = 0 (PDXFS_TXN_PARENT_STUB)
+// as a best-effort probe: the mint walker's PXT_MINT_BAD_PARENT gate
+// (slot 0 is almost certainly not a live KIND_MEMORY cap under the
+// current loader) is expected to reject it, and copy_bytes_only
+// treats ANY negative return from pdxfs_txn_begin as "no TXN
+// available this run" and falls back to its pre-#35 non-transactional
+// body -- see Copy::copy_bytes_only Step 4.5. This keeps the wire-in
+// forward-compatible (the day a real parent_slot is discoverable,
+// only the constant below needs to change) without regressing any
+// existing passing invocation today.
+//
+// Cross-module externs consumed: none (leaf module).
+//
+// paideia-as compliance (v0.36+ / feedback_pdx_encoder_pitfalls)
+// -----------------------------------------------------------------
+//   - Module PdxfsTxn (PascalCase basename matches src/pdxfs_txn.pdx).
+//   - No test mnemonic; every zero/sign-check via `cmp reg, 0`.
+//   - No `and rN, imm64` anywhere in this file.
+//   - No 2-op imul.
+//   - Every function <= 4 curried args. pdxfs_txn_begin is the widest
+//     at 4 (parent_slot, mode, txn_id, wal_off); the real 5-arg
+//     sys_pdxfs_undo_write shape is split across pdxfs_txn_bind
+//     (cap_slot, inode_no -- set once per destination file) +
+//     pdxfs_txn_add_write (offset, len, kbuf_ptr -- called once per
+//     block) so no single function exceeds 4 params.
+//   - Arity-4 pdxfs_txn_begin uses the standard SysV-rcx-to-syscall-
+//     r10 shuffle (`mov r10, rcx`) -- same idiom as mv's pdxfs_link /
+//     sys_rename trampolines.
+//   - pdxfs_txn_add_write builds all five real syscall args (cap_slot
+//     + inode_no from the .bss binding, offset/len/kbuf_ptr from its
+//     own 3 curried params) without ever touching rcx, so no shuffle
+//     is needed there either -- len is placed directly into r10.
+//   - r11 is scratch for every lea against a .bss base.
+//   - Every function ends in a matching (possibly empty) epilogue +
+//     ret. No branches in this file, so no reserved-label exposure.
+// ============================================================================
+
+module PdxfsTxn = structure {
+
+  // -- Mode ordinals (mirror kernel pdxfs_txn_cap_mint_inner gate) ----
+  pub let PXT_MODE_CREATE : u64 = 1
+  pub let PXT_MODE_MODIFY : u64 = 2
+  pub let PXT_MODE_DELETE : u64 = 3
+
+  // -- parent_slot stub (see module header) ---------------------------
+  pub let PDXFS_TXN_PARENT_STUB : u64 = 0
+
+  // -- Per-file binding state (set once via pdxfs_txn_bind, read by
+  //    every subsequent pdxfs_txn_add_write in the same copy loop) --
+  pub let mut pdxfs_txn_cap_ctx   : u64 = uninit @align(8)
+  pub let mut pdxfs_txn_inode_ctx : u64 = uninit @align(8)
+
+  // -- Monotonic txn_id source. Kernel mint gate refuses txn_id == 0
+  //    (PXT_MINT_BAD_ID), so the counter starts at 1 and every call
+  //    to pdxfs_txn_alloc_id bumps it first. ---------------------------
+  pub let mut pdxfs_txn_next_id : u64 = uninit @align(8)
+
+  // ============================================================================
+  // pdxfs_txn_alloc_id() -> txn_id
+  //
+  // Signature: pdxfs_txn_alloc_id : () -> u64 !{mem} @{}
+  // RAX (output): next non-zero txn_id (monotonic per process lifetime).
+  // ============================================================================
+  pub let pdxfs_txn_alloc_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_alloc_id (paideia-os/cp#35). Bumps the module .bss counter and returns the new value; starts effectively at 1 because pdxfs_txn_next_id is zero-initialised .bss and this function increments BEFORE reading. Leaf; r11 scratch for the lea.",
+      block: {
+        lea r11, [rip + pdxfs_txn_next_id];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_begin(parent_slot, mode, txn_id, wal_off) -> cap_slot_or_errno
+  //
+  // Signature: pdxfs_txn_begin : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  // Trampoline for paideia-os sysno 70 (sys_pdxfs_txn_open). Arity 4:
+  // SysV rdi/rsi/rdx/rcx map to the syscall's parent_slot/mode/txn_id/
+  // wal_off, but SYSCALL clobbers rcx as the return-address slot so
+  // arg4 (wal_off) is shuffled into r10 before the trap, matching the
+  // mv pdxfs_link / sys_rename precedent.
+  //
+  // RAX (output): cap_slot in [0, 256) on success; a negative-errno /
+  //   mint-sentinel u64 on failure (PXT_MINT_BAD_PARENT = 0xFFFFEC1D
+  //   most likely today, given the parent_slot=0 stub -- see module
+  //   header). Caller treats ANY negative rax as "no TXN this run".
+  // ============================================================================
+  pub let pdxfs_txn_begin : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (parent_slot: u64) (mode: u64) (txn_id: u64) (wal_off: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_begin (paideia-os/cp#35). Trampoline for paideia-os sysno 70 (sys_pdxfs_txn_open_body, R42-PREP-007 #1629). SysV arg1=rdi(parent_slot), arg2=rsi(mode), arg3=rdx(txn_id), arg4=rcx(wal_off) shuffled to r10 before SYSCALL (rcx is the SYSRET return-address slot). Return verbatim: cap_slot in [0,256) success, PXT_MINT_* sentinel (>=0xFFFFEC10) or -ENFILE (-33) on failure. capabilities {} declared empty here (this is a ring-3 trampoline, not the kernel body -- the kernel-side @{cap} effect is the syscall's own posture, invisible to the caller-side effect row). Leaf; sysreg for the SYSCALL clobber (rcx/r11).",
+      block: {
+        mov r10, rcx;                          // SysV rcx -> syscall r10 (wal_off)
+        mov rax, 70;                            // SYS_PDXFS_TXN_OPEN
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_bind(cap_slot, inode_no) -> ()
+  //
+  // Signature: pdxfs_txn_bind : (u64, u64) -> () !{mem} @{}
+  // Stores the active txn's cap_slot + destination inode_no into
+  // module .bss so pdxfs_txn_add_write's per-block calls stay at 3
+  // curried args instead of needing the full 5-field sys_pdxfs_
+  // undo_write shape on every block. Call once per destination file,
+  // immediately after a successful pdxfs_txn_begin.
+  // ============================================================================
+  pub let pdxfs_txn_bind : (u64, u64) -> () !{mem} @{} =
+    fn (cap_slot: u64) (inode_no: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_bind (paideia-os/cp#35). Pure .bss store, no syscall. Splits sys_pdxfs_undo_write's 5-field real shape (cap_slot, inode_no, offset, len, kbuf_ptr) across a once-per-file bind (this function) + a per-block pdxfs_txn_add_write, keeping every function in this module <= 4 curried args (feedback_pdx_encoder_pitfalls). Leaf; r11 scratch for the two leas.",
+      block: {
+        lea r11, [rip + pdxfs_txn_cap_ctx];
+        mov [r11], rdi;
+        lea r11, [rip + pdxfs_txn_inode_ctx];
+        mov [r11], rsi;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_add_write(offset, len, kbuf_ptr) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_add_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  // Trampoline for paideia-os sysno 107 (sys_pdxfs_undo_write), the
+  // landed per-block WAL primitive closest to an "add_write" op.
+  // cap_slot + inode_no come from the pdxfs_txn_bind .bss context
+  // (NOT curried params -- see module header for the arity-4-ceiling
+  // rationale); offset/len/kbuf_ptr are this call's own 3 params.
+  //
+  // RDI (input): offset    -- byte offset into the destination inode
+  //                            where this block's write lands
+  // RSI (input): len       -- length of this block (<= 4096; the
+  //                            final block of a file may be shorter)
+  // RDX (input): kbuf_ptr  -- VA of the block just handed to
+  //                            pdxfs_write (Copy::copy_buf in
+  //                            practice); best-effort WAL record of
+  //                            what was written, not yet a true
+  //                            pre-image snapshot -- full pre-image
+  //                            capture (reading the destination's
+  //                            prior content before each overwrite)
+  //                            remains tracked as future work per
+  //                            CHANGELOG.md's existing cp#35 Follow-
+  //                            up note on commit-and-reopen batching.
+  // RAX (output): 0 on success; negative-errno u64 on failure
+  //               (PDXFS_UNDO_EINVAL / PDXFS_UNDO_ENOSPC).
+  // ============================================================================
+  pub let pdxfs_txn_add_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (offset: u64) (len: u64) (kbuf_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_add_write (paideia-os/cp#35). Trampoline for paideia-os sysno 107 (sys_pdxfs_undo_write_body, R90-XREPO.010.M1-004 #2112). Real syscall wants 5 args (cap_slot, inode_no, offset, len, kbuf_ptr); this function's own curried surface is 3 (offset/len/kbuf_ptr) with cap_slot/inode_no read back from the pdxfs_txn_bind .bss context, keeping every function in this module <= 4 curried args. Register shuffle: r8 <- rdx (kbuf_ptr, entry arg3) FIRST, then r10 <- rsi (len, entry arg2), then rdx <- rdi (offset, entry arg1) -- each entry register is consumed exactly once before being overwritten, so no temp beyond the destination registers is needed. rdi/rsi are then reloaded from the .bss context for cap_slot/inode_no. len lands directly in r10 (never touches rcx), so no SysV-rcx-to-syscall-r10 shuffle is needed here despite the arity-5 syscall shape. Leaf; sysreg for the SYSCALL clobber.",
+      block: {
+        mov r8, rdx;                            // r8 = kbuf_ptr (final arg5)
+        mov r10, rsi;                           // r10 = len (final arg4)
+        mov rdx, rdi;                           // rdx = offset (final arg3)
+        lea r11, [rip + pdxfs_txn_cap_ctx];
+        mov rdi, [r11];                         // rdi = cap_slot (final arg1)
+        lea r11, [rip + pdxfs_txn_inode_ctx];
+        mov rsi, [r11];                         // rsi = inode_no (final arg2)
+        mov rax, 107;                           // SYS_PDXFS_UNDO_WRITE
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_commit(cap_slot) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_commit : (u64) -> u64 !{mem, sysreg} @{}
+  // Trampoline for paideia-os sysno 104 (sys_pdxfs_txn_commit). Arity
+  // 1; no shuffle. RAX: 0 on success, negative-errno / PXT_BAD_
+  // TRANSITION sentinel on failure.
+  // ============================================================================
+  pub let pdxfs_txn_commit : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_commit (paideia-os/cp#35). Trampoline for paideia-os sysno 104 (sys_pdxfs_txn_commit_body, R90-XREPO.010.M1-003 #2111). Arity 1, no register shuffle. Return verbatim. Leaf; sysreg for the SYSCALL clobber.",
+      block: {
+        mov rax, 104;                           // SYS_PDXFS_TXN_COMMIT
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_abort(cap_slot) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_abort : (u64) -> u64 !{mem, sysreg} @{}
+  // Trampoline for paideia-os sysno 105 (sys_pdxfs_txn_abort). Arity
+  // 1; no shuffle.
+  // ============================================================================
+  pub let pdxfs_txn_abort : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "cp v1.3.0 pdxfs_txn_abort (paideia-os/cp#35). Trampoline for paideia-os sysno 105 (sys_pdxfs_txn_abort_body, R90-XREPO.010.M1-003 #2111 + M1-004 #2112 undo-replay extension). Arity 1, no register shuffle. Return verbatim. Called from every copy_bytes_only error branch reached after a successful pdxfs_txn_begin (read/write/short-write failures). Leaf; sysreg for the SYSCALL clobber.",
+      block: {
+        mov rax, 105;                           // SYS_PDXFS_TXN_ABORT
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_txn_status / pdxfs_txn_free -- NOT WIRED
+  //
+  // The dispatch template for this landing asked for status (109) and
+  // free (110) trampolines. No sys_pdxfs_txn_status or sys_pdxfs_txn_
+  // close/free syscall exists in the kernel at this commit (the real
+  // sys_pdxfs_txn_commit_body / _abort_body headers both say row
+  // release + cap-slot clear are "DEFERRED... awaiting a future
+  // sys_pdxfs_txn_close"). Fabricating trampolines against sysnos
+  // 108-110 would either hit dispatch.pdx's unrouted-sysno default
+  // arm (harmless but pointless) or, if a future unrelated syscall
+  // claims one of those numbers first, silently call the wrong
+  // handler. Deferring both, matching this module's "wire only what
+  // is actually landed" discipline. Tracked as follow-up once
+  // sys_pdxfs_txn_close lands kernel-side.
+  // ============================================================================
+}

@@ -102,12 +102,17 @@ requires:
   # parent path prefix at exec so cp cannot write outside the argument.
   - KIND_PDXFS_FILE (write, <dst-parent>)
 
-  # Volume reference for the outer TXN wire (paideia-os/cp#35 body
-  # edit). Narrowed to INVOKE against the destination mount. The
-  # loader resolves <mount> to the mount slot covering <dst-parent>
-  # (single-volume common case) or refuses at exec time if the mount
-  # slot is unreachable. Declared at v1.2.0 per R90-XREPO.013.M3-003
-  # (paideia-os/cp#31); invoke arm defers to cp#35.
+  # Volume reference for the outer TXN wire. Narrowed to INVOKE
+  # against the destination mount. The loader resolves <mount> to the
+  # mount slot covering <dst-parent> (single-volume common case) or
+  # refuses at exec time if the mount slot is unreachable. Declared at
+  # v1.2.0 per R90-XREPO.013.M3-003 (paideia-os/cp#31). v1.3.0
+  # (paideia-os/cp#35) adds the first invoke call site
+  # (PdxfsTxn::pdxfs_txn_begin, sysno 70) but no loader-side slot-
+  # discovery syscall exists yet to resolve <mount> to a real cap
+  # slot -- the call runs with a stub parent_slot=0 and is expected
+  # to fail the kernel's mint gate until that lands, at which point
+  # copy_bytes_only degrades to its pre-#35 non-transactional body.
   - KIND_PDXFS_VOL  (invoke, <mount>)
 
 # Declared output schemas -- the semantic-pipe schema records this tool

@@ -7,6 +7,81 @@ and every issue it lands, so the release-tag ↔ code-tree ↔ issue-
 graph triangulation the signing pipeline uses at `paideia-as
 release --sign` time is reproducible from this file alone.
 
+## 1.3.0 — 2026-09-13 (outer TXN wrap + v1.2 planning)
+
+Closes paideia-os/cp#35 (`cp.ENH-011` — outer TXN re-wire against the
+R90 kernel substrate) and paideia-os/cp#37 (v1.2 planning trackers
+for `-p` / `-r`, planning-only).
+
+### Added
+
+- `src/pdxfs_txn.pdx` — new module `PdxfsTxn`. Five trampolines
+  against the landed R90 KIND_PDXFS_TXN substrate: `pdxfs_txn_begin`
+  (sysno 70, arity 4), `pdxfs_txn_bind` (pure `.bss` context store,
+  no syscall), `pdxfs_txn_add_write` (sysno 107 = sys_pdxfs_undo_
+  write), `pdxfs_txn_commit` (sysno 104), `pdxfs_txn_abort` (sysno
+  105), plus `pdxfs_txn_alloc_id` (monotonic txn_id counter). The
+  module header documents a sysno reconciliation: the original
+  dispatch template assumed 106/108/109/110 for add_write/abort/
+  status/free, but the actual landed kernel (dispatch.pdx +
+  handlers/sys_pdxfs_txn_*.pdx, R90-XREPO.010 #2111/#2112) uses
+  104=commit, 105=abort, 107=undo_write, and has no status/free
+  syscall yet — this module wires only what is real. `add_write`'s
+  5-field real syscall shape is split across `pdxfs_txn_bind`
+  (cap_slot, inode_no — once per file) + `pdxfs_txn_add_write`
+  (offset, len, kbuf_ptr — once per block) so no function in the
+  module exceeds 4 curried args.
+- `src/copy.pdx::copy_bytes_only` — new Step 4.5 best-effort outer
+  TXN wrap. After both fds open, stats the effective dst path for its
+  inode number and calls `pdxfs_txn_begin` with a stub `parent_slot
+  = 0` (no loader-side KIND_PDXFS_VOL slot-discovery syscall exists
+  yet — see `pdxfs_txn.pdx` header). ANY negative return sets `r12`
+  (dead after open-dst) to the `TXN_INACTIVE` (-1) sentinel and every
+  downstream TXN call site gates on `cmp r12, 0; jl`, so this landing
+  degrades cleanly to the pre-#35 body with zero behavioural change
+  until a real parent_slot is discoverable. When a TXN opens, every
+  write block calls `pdxfs_txn_add_write` before its byte count is
+  accumulated, the `cp_eof` success tail calls `pdxfs_txn_commit`,
+  and the `cp_read_fail` / `cp_write_fail` / `cp_short_write` error
+  branches call `pdxfs_txn_abort` before their existing close +
+  diagnostic logic.
+- `design/cp-v1.2-planning.md` — new planning-only design doc for
+  `-p` (permission preserve: chmod/chown/utimensat, fail-open except
+  chmod) and `-r` (recursive: readdir + per-entry recurse-or-copy, no
+  symlink descent without a future `-L`), an argv-parsing note, and a
+  test-matrix placeholder (`tests/cp_p.pdx` / `tests/cp_r.pdx`
+  shapes). Implementation is explicitly deferred to a future
+  v1.2.0-A-shaped release; paideia-os/cp#37 is planning only.
+
+### Changed
+
+- `manifest.pdxproj` — `version = 1.2.0` -> `1.3.0`; source list adds
+  `src/pdxfs_txn.pdx` (8 sources total).
+- `manifest.pdxsig` — `version = 1.2.0` -> `1.3.0`.
+- `caps.decl` — `KIND_PDXFS_VOL (invoke, <mount>)` row's comment
+  updated: the invoke call site now exists (`pdxfs_txn_begin`) but
+  runs against a stub slot pending the loader-side discovery syscall.
+
+### Not changed
+
+- `src/pdxfs.pdx`, `src/dispatch.pdx`, `src/main.pdx`, `src/pipe.pdx`,
+  `src/tool_ident.pdx`, `src/print.pdx` — byte-identical to v1.2.0.
+
+### Follow-up
+
+- Real `parent_slot` resolution for `pdxfs_txn_begin` once a loader-
+  side KIND_PDXFS_VOL slot-discovery syscall lands — only the stub
+  constant in `src/pdxfs_txn.pdx` needs to change.
+- True per-write pre-image capture for `pdxfs_txn_add_write` (today's
+  `kbuf_ptr` is the block just written, a best-effort WAL record, not
+  a genuine pre-overwrite snapshot) plus the commit-and-reopen
+  batching a large-file copy needs against the 32-records/4KiB row
+  cap — carried over from the v1.2.0 Follow-up note.
+- `sys_pdxfs_txn_status` / `sys_pdxfs_txn_close` trampolines once the
+  kernel lands those syscalls (currently no sysno assigned).
+- paideia-os/cp#37's `-p` / `-r` implementation, tracked for a future
+  v1.2.0-A-shaped release per `design/cp-v1.2-planning.md`.
+
 ## 1.2.0 — 2026-09-13 (Wave D drain close-out)
 
 Closes paideia-os/cp#31 (`R90-XREPO.013.M3-003 cp — caps.decl +
