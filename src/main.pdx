@@ -38,12 +38,23 @@
 //
 // Cross-module externs consumed
 // -----------------------------
-//   FlagSpec::reset          (libpdx-argv)
-//   StdVocab::register_all   (libpdx-argv)
-//   ParsedArgs::reset        (libpdx-argv)
-//   Parser::parse_argv       (libpdx-argv)
-//   Dispatch::dispatch_copy  (this repo, src/dispatch.pdx)
-//   Print::print_err         (this repo, src/print.pdx)
+//   FlagSpec::flag_spec_reset   (libpdx-argv ENH-030 rename; was `reset`)
+//   StdVocab::register_all      (libpdx-argv)
+//   ParsedArgs::parsed_args_reset (libpdx-argv ENH-030 rename; was `reset`)
+//   Parser::parse_argv          (libpdx-argv)
+//   Dispatch::dispatch_copy     (this repo, src/dispatch.pdx)
+//   Print::print_err            (this repo, src/print.pdx)
+//
+// cp.ENH-010 fix (paideia-os/cp#26): pre-ENH-010 cp_main called bare
+// `reset` at two sites, one for FlagSpec and one for ParsedArgs. After
+// libpdx-argv.ENH-030 renamed both singleton resets to distinct symbols
+// (`flag_spec_reset` / `parsed_args_reset`), the single-name collision
+// bound BOTH call sites to whichever `reset` the linker resolved first,
+// silently short-circuiting one of the two required resets and letting
+// stale state leak between successive cp_main invocations (a fixture
+// that pre-registered flags, or a test-suite that ran cp twice, would
+// see the second parse re-read the first parse's flag_count/spec_count).
+// v1.1-B pins each call site to its intended callee by name.
 //
 // paideia-as compliance (v0.36+)
 // ------------------------------
@@ -90,7 +101,7 @@ module Main = structure {
   pub let cp_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "cp v1.1-A cp_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset libpdx-argv flag table -> register standard vocabulary -> reset argv parse state -> parse via libpdx-argv -> hand off to Dispatch::dispatch_copy. Retires the v1.0 M1-001 STUB shape's seven counter-resets (cp_pipe_reset, cp_audit_reset, cp_elevate_reset, copy_reset, walk_reset, undo_reset, signed_inode_reset), the register_cp_flags call (no cp-owned flags at v1.1-A -- -r/-v/--over-existing all retire with the stub-heavy body), and the cp_pipe_bind_stdout call (CopyProgressRecord schema binding retires with libpdx-semantic-pipe). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (5 calls now: FlagSpec::reset, StdVocab::register_all, ParsedArgs::reset, Parser::parse_argv, Dispatch::dispatch_copy, plus the optional Print::print_err on the parse-fail path). rbx/r12 preserved across every nested call -- the callee-save contract from SysV holds through libpdx-argv. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE=2. Otherwise return dispatch_copy's exit code (0 on success, 2 on wrong pos_count, or negative-errno u64 on copy failure). All immediates within cmp reg,imm <= 0x7FFFFFFF.",
+      justification: "cp v1.1-B cp_main (paideia-os/cp#26). Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset libpdx-argv FlagSpec table (flag_spec_reset) -> register standard vocabulary -> reset argv ParsedArgs state (parsed_args_reset) -> parse via libpdx-argv -> hand off to Dispatch::dispatch_copy. cp.ENH-010 fix: pre-v1.1-B called bare `reset` at both sites; libpdx-argv.ENH-030 had renamed the singleton resets into distinct exported symbols (flag_spec_reset / parsed_args_reset / schema_emit_reset / pdxargv_help_reset / pdxargv_version_reset) to end the multi-module link collision, but cp_main had not been updated — the linker resolved both bare `reset` call sites to whichever symbol was seen first, silently short-circuiting one of the two required resets. v1.1-B pins each call to its intended target by name. Retires the v1.0 M1-001 STUB shape's seven counter-resets (cp_pipe_reset, cp_audit_reset, cp_elevate_reset, copy_reset, walk_reset, undo_reset, signed_inode_reset), the register_cp_flags call (no cp-owned flags at v1.1-A -- -r/-v/--over-existing all retire with the stub-heavy body), and the cp_pipe_bind_stdout call (CopyProgressRecord schema binding retires with libpdx-semantic-pipe). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (5 calls now: FlagSpec::reset, StdVocab::register_all, ParsedArgs::reset, Parser::parse_argv, Dispatch::dispatch_copy, plus the optional Print::print_err on the parse-fail path). rbx/r12 preserved across every nested call -- the callee-save contract from SysV holds through libpdx-argv. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE=2. Otherwise return dispatch_copy's exit code (0 on success, 2 on wrong pos_count, or negative-errno u64 on copy failure). All immediates within cmp reg,imm <= 0x7FFFFFFF.",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 -> 0
@@ -102,11 +113,15 @@ module Main = structure {
 
         // Step 1: reset FlagSpec and register the standard vocabulary.
         // No cp-owned flags at v1.1-A -- retires register_cp_flags.
-        call reset;
+        // cp.ENH-010 fix (cp#26): pin to flag_spec_reset (was bare `reset`,
+        // which collided with parsed_args_reset at link time).
+        call flag_spec_reset;
         call register_all;
 
         // Step 2: reset libpdx-argv parse state.
-        call reset;
+        // cp.ENH-010 fix (cp#26): pin to parsed_args_reset (was bare
+        // `reset`, which collided with flag_spec_reset at link time).
+        call parsed_args_reset;
 
         // Step 3: parse. rdi = argv, rsi = argc.
         mov rdi, rbx;
